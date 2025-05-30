@@ -186,6 +186,31 @@ def get_send_edit_cancel_confirmation(draft_text: str, service_name: str = "emai
             return "cancel"
         print(f"{Fore.RED}Invalid choice. Please enter S, E, or C.{Style.RESET_ALL}")
 
+def get_send_edit_save_cancel_confirmation(draft_text: str, service_name: str = "email") -> str:
+    """
+    Displays a draft and asks for confirmation: Send, Edit, Save as Draft, or Cancel.
+    Returns "send", "edit", "save_draft", or "cancel".
+    """
+    print_header(f"Draft {service_name.capitalize()}")
+    print(f"{Fore.WHITE}{draft_text}{Style.RESET_ALL}")
+
+    while True:
+        choice = input(
+            f"{Fore.CYAN}Action: ({Style.BRIGHT}{Fore.GREEN}S{Style.RESET_ALL}{Fore.CYAN})end Reply, "
+            f"({Style.BRIGHT}{Fore.YELLOW}E{Style.RESET_ALL}{Fore.CYAN})dit, "
+            f"Save as (D)raft, " # New option
+            f"({Style.BRIGHT}{Fore.RED}C{Style.RESET_ALL}{Fore.CYAN})ancel? {Style.RESET_ALL}"
+        ).strip().lower()
+        if choice in ['s', 'send']:
+            return "send_reply" # Be specific
+        if choice in ['e', 'edit']:
+            return "edit"
+        if choice in ['d', 'draft', 'save draft']: # New
+            return "save_draft"
+        if choice in ['c', 'cancel', '']:
+            return "cancel"
+        print(f"{Fore.RED}Invalid choice. Please enter S, E, D, or C.{Style.RESET_ALL}")
+
 
 if __name__ == "__main__":
     print("--- Testing user_interface.py ---")
@@ -216,7 +241,7 @@ if __name__ == "__main__":
 
     print("\nTesting draft confirmation:")
     draft = "Hello,\n\nThis is a sample draft email.\n\nBest,\nAssistant"
-    confirmation = get_send_edit_cancel_confirmation(draft)
+    confirmation = confirmation = get_send_edit_save_cancel_confirmation(draft)
     print(f"User confirmation for draft: {confirmation}")
 
     print("\n--- Test complete ---")

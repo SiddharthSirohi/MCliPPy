@@ -4,10 +4,12 @@ import json
 import traceback
 import asyncio
 import config_manager # For GOOGLE_API_KEY in test stub
+from typing import Dict, List, Optional, Any, Tuple
+
 
 # --- Email Processing ---
 # (process_emails_with_llm function remains largely the same, no changes for these specific errors)
-async def process_emails_with_llm(gemini_model, emails_data: list, user_persona: str, user_priorities: str):
+async def process_emails_with_llm(gemini_llm_model, emails_data: list, user_persona: str, user_priorities: str):
     # ... (previous code for this function) ...
     if not emails_data:
         return []
@@ -72,7 +74,7 @@ Ensure the entire response is a valid JSON array.
     processed_emails = []
     response_text_for_debugging = "Gemini call did not occur or failed before response was received."
     try:
-        response = await gemini_model.generate_content_async(system_prompt)
+        response = await gemini_llm_model.generate_content_async(system_prompt)
         response_text_for_debugging = response.text
 
         cleaned_response_text = response.text.strip()
@@ -119,7 +121,7 @@ Ensure the entire response is a valid JSON array.
     return processed_emails
 
 # --- Calendar Event Processing ---
-async def process_calendar_events_with_llm(gemini_model, events_data: list, user_persona: str, user_priorities: str):
+async def process_calendar_events_with_llm(gemini_llm_model, events_data: list, user_persona: str, user_priorities: str):
     if not events_data:
         return []
     prompt_event_parts = []
@@ -174,7 +176,7 @@ Ensure the entire response is a valid JSON array.
     processed_events = []
     response_text_for_debugging = "Gemini call did not occur or failed before response was received."
     try:
-        response = await gemini_model.generate_content_async(system_prompt)
+        response = await gemini_llm_model.generate_content_async(system_prompt)
         response_text_for_debugging = response.text
 
         cleaned_response_text = response.text.strip()
@@ -221,6 +223,133 @@ Ensure the entire response is a valid JSON array.
 
 # ... (other imports: genai, json, traceback, asyncio, config_manager) ...
 # ... (process_emails_with_llm and process_calendar_events_with_llm functions remain the same) ...
+
+async def draft_email_reply_with_llm(
+    # ... (parameters are the same) ...
+) -> Dict[str, str]:
+    # ... (logic to extract original_sender, original_subject, original_thread_id is the same) ...
+
+    prompt = f"""
+You are an AI assistant helping a user draft an email reply.
+User's Role: '{user_persona}'
+User's Priorities: '{user_priorities}'
+
+Original Email Details:
+From: {original_sender}
+Subject: {original_subject} # LLM still needs this for context
+Thread ID: {original_thread_id}
+Snippet/Preview: {original_snippet[:300]}
+
+The user wants to: "{action_sentiment}".
+"""
+    if user_edit_instructions:
+        prompt += f"\nUser's specific instructions for this draft: \"{user_edit_instructions}\"\n"
+
+    prompt += """
+Based on this, please generate:
+1. A "subject" line for context (e.g., "Re: [original subject]"). Even if the reply tool doesn't use it, it's good for display.
+2. A professional and concise email "body" for the reply.
+
+Format your response as a single JSON object with the keys "subject" and "body".
+Example:
+{
+  "subject": "Re: Meeting Request",
+  "body": "Hi [Sender Name],\n\nThanks for reaching out. I'm available on Tuesday afternoon.\n\nBest,\n[User's Name (or generic sign-off)]"
+}
+Ensure the body is plain text. Do not include any other explanatory text outside the JSON object.
+"""
+    # ... (Gemini call and parsing logic remains the same) ...
+    # Ensure the return includes all necessary fields:
+    # if isinstance(draft_data, dict) and "subject" in draft_data and "body" in draft_data:
+    #     return {
+    #         "subject": draft_data["subject"], # For display or if saving as draft
+    #         "body": draft_data["body"],
+    #         "recipient_email_for_reply": original_sender,
+    #         "original_thread_id": original_thread_id,
+    #         "error": None
+    #     }
+    # ...
+    # (The rest of the function is the same)
+    if not original_email_data:
+        return {"error": "Original email data not provided."}
+
+    original_subject = "No Subject"
+    original_sender = "Unknown Sender"
+    original_snippet = original_email_data.get("snippet", "")
+    # original_message_id = original_email_data.get("messageId", "N/A") # Not strictly needed for reply draft
+    original_thread_id = original_email_data.get("threadId", "N/A")
+
+    payload = original_email_data.get("payload")
+    if payload and isinstance(payload.get("headers"), list):
+        for header in payload["headers"]:
+            header_name_lower = header.get("name", "").lower()
+            if header_name_lower == "from":
+                # Extract just the email from "Display Name <email@example.com>"
+                val = header.get("value", "Unknown Sender")
+                if "<" in val and ">" in val:
+                    original_sender = val[val.find("<")+1:val.find(">")]
+                else:
+                    original_sender = val # Assume it's just the email
+            elif header_name_lower == "subject":
+                original_subject = header.get("value", "No Subject")
+
+    prompt_context = f"""
+Original Email:
+From: {original_sender}
+Subject: {original_subject}
+Thread ID: {original_thread_id}
+Snippet: {original_snippet[:300]}
+
+User wants to respond with the sentiment/action: "{action_sentiment}".
+"""
+    if user_edit_instructions:
+        prompt_context += f"\nUser's specific edit instructions: \"{user_edit_instructions}\"\n"
+
+    full_prompt = f"""
+You are an AI assistant for a user whose role is: '{user_persona}'. Their priorities are: '{user_priorities}'.
+You are helping them draft an email reply.
+
+{prompt_context}
+
+Generate a JSON object with "subject" and "body" for the reply.
+The subject should typically be "Re: [original subject]".
+The body should be a professional, concise reply reflecting the user's intent.
+Example JSON:
+{{
+  "subject": "Re: Original Subject",
+  "body": "Dear [Sender Name],\n\n[Your reply text here]\n\nThanks,\n[User's Name (or generic sign-off)]"
+}}
+"""
+    response_text_for_debugging = "Gemini call for draft did not occur or failed."
+    try:
+        response = await gemini_llm_model.generate_content_async(full_prompt)
+        response_text_for_debugging = response.text
+
+        cleaned_response_text = response.text.strip()
+        if cleaned_response_text.startswith("```json"): cleaned_response_text = cleaned_response_text[7:]
+        if cleaned_response_text.endswith("```"): cleaned_response_text = cleaned_response_text[:-3]
+
+        draft_data = json.loads(cleaned_response_text)
+        if isinstance(draft_data, dict) and "subject" in draft_data and "body" in draft_data:
+            return {
+                "subject": draft_data["subject"],
+                "body": draft_data["body"],
+                "recipient_email_for_reply": original_sender,
+                "original_thread_id": original_thread_id,
+                "error": None
+            }
+        else:
+            return {"error": "LLM did not return draft in expected subject/body format."}
+    # ... (rest of error handling is the same) ...
+    except json.JSONDecodeError:
+        print(f"LLM_PROCESSOR (Draft Reply): Failed to decode Gemini JSON response for draft.")
+        print(f"LLM_PROCESSOR (Draft Reply): Raw response: {response_text_for_debugging}")
+        return {"error": "LLM JSON parsing error for draft."}
+    except Exception as e:
+        print(f"LLM_PROCESSOR (Draft Reply): Error during Gemini API call for draft: {e}")
+        print(f"LLM_PROCESSOR (Draft Reply): Raw response: {response_text_for_debugging}")
+        traceback.print_exc()
+        return {"error": "LLM API call error for draft."}
 
 # --- Test Stub for this module ---
 async def _test_llm_processor():

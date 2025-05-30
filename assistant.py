@@ -69,7 +69,7 @@ def run_signup_flow(): # Stays in assistant.py as it uses config_manager directl
     return user_config
 
 # --- Main Application Logic (Async now) ---
-async def perform_proactive_checks(user_config, gemini_model) -> tuple[bool, List[Dict[str, Any]], List[Dict[str, Any]]]:
+async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool, List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Performs one cycle of proactive checks for Gmail and Calendar.
     Processes fetched data with LLM.
@@ -184,7 +184,7 @@ async def perform_proactive_checks(user_config, gemini_model) -> tuple[bool, Lis
     if all_fetched_raw_messages and user_config.get(config_manager.NOTIFICATION_PREFS_KEY, {}).get("email", "off") == "important":
         # user_interface.print_header(f"Processing {len(all_fetched_raw_messages)} Gmail messages with LLM")
         processed_emails_from_llm = await llm_processor.process_emails_with_llm(
-            gemini_model, all_fetched_raw_messages, user_persona, user_priorities
+            gemini_llm_model, all_fetched_raw_messages, user_persona, user_priorities
         )
         if processed_emails_from_llm:
             for pe_data in processed_emails_from_llm:
@@ -264,7 +264,7 @@ async def perform_proactive_checks(user_config, gemini_model) -> tuple[bool, Lis
     if raw_calendar_events and user_config.get(config_manager.NOTIFICATION_PREFS_KEY, {}).get("calendar", "off") != "off":
         # user_interface.print_header(f"Processing {len(raw_calendar_events)} Calendar events with LLM")
         processed_events_llm_data = await llm_processor.process_calendar_events_with_llm(
-            gemini_model, raw_calendar_events, user_persona, user_priorities
+            gemini_llm_model, raw_calendar_events, user_persona, user_priorities
         )
         # print(f"LLM processed {len(processed_events_llm_data)} calendar event(s).")
 
@@ -294,6 +294,124 @@ async def perform_proactive_checks(user_config, gemini_model) -> tuple[bool, Lis
     print(f"{user_interface.Style.DIM}Proactive checks cycle complete.{user_interface.Style.RESET_ALL}")
     return True, important_emails_llm_data, processed_events_llm_data
 
+# assistant.py
+# ...
+
+async def handle_draft_email_reply(
+    gemini_llm_model,
+    chosen_email_data: Dict[str, Any],
+    initial_llm_action_text: str,
+    user_config: Dict[str, Any],
+    gmail_mcp_manager: McpSessionManager
+):
+    user_persona = user_config.get(config_manager.USER_PERSONA_KEY)
+    user_priorities = user_config.get(config_manager.USER_PRIORITIES_KEY)
+
+    current_draft_info = None
+    user_edit_instructions = None # Store edit instructions for LLM
+
+    print(f"\n{user_interface.Style.DIM}Drafting reply for '{chosen_email_data['original_email_data'].get('subject', 'N/A')}' based on action: '{initial_llm_action_text}'...{user_interface.Style.RESET_ALL}")
+    current_draft_info = await llm_processor.draft_email_reply_with_llm(
+        gemini_llm_model,
+        chosen_email_data['original_email_data'],
+        initial_llm_action_text,
+        user_persona,
+        user_priorities
+    )
+
+    while True:
+        if not current_draft_info or current_draft_info.get("error"):
+            error_msg = current_draft_info.get("error", "Failed to generate draft.") if current_draft_info else "Failed to generate draft."
+            print(f"{user_interface.Fore.RED}Error: {error_msg}{user_interface.Style.RESET_ALL}")
+            return False
+
+        draft_body = current_draft_info.get("body")
+        draft_subject = current_draft_info.get("subject") # Still useful for context and save_draft
+
+        # Use the new confirmation function
+        confirmation_choice = user_interface.get_send_edit_save_cancel_confirmation(
+            f"Subject: {draft_subject}\n\n{draft_body}",
+            service_name="Email Reply"
+        )
+
+        if confirmation_choice == "send_reply":
+            print(f"{user_interface.Style.DIM}Preparing to send reply via Gmail...{user_interface.Style.RESET_ALL}")
+            recipient_for_reply = current_draft_info.get("recipient_email_for_reply")
+            original_thread_id = current_draft_info.get("original_thread_id")
+
+            if not recipient_for_reply or not original_thread_id or not draft_body:
+                 print(f"{user_interface.Fore.RED}Critical reply information missing (recipient, thread ID, or body). Cannot send.{user_interface.Style.RESET_ALL}")
+                 return False
+
+            if not gmail_mcp_manager or not gmail_mcp_manager.session:
+                print(f"{user_interface.Fore.RED}Gmail MCP session not available. Cannot send reply.{user_interface.Style.RESET_ALL}")
+                return False
+
+            send_reply_outcome = await gmail_mcp_manager.reply_to_gmail_thread(
+                thread_id=original_thread_id,
+                recipient_email=recipient_for_reply, # Original sender
+                message_body=draft_body
+            )
+            if send_reply_outcome.get("successful"):
+                print(f"{user_interface.Fore.GREEN}Success! {send_reply_outcome.get('message', 'Reply sent.')}{user_interface.Style.RESET_ALL}")
+                return True
+            else:
+                error_msg = send_reply_outcome.get('error', 'Failed to send reply via MCP.')
+                print(f"{user_interface.Fore.RED}MCP Error: {error_msg}{user_interface.Style.RESET_ALL}")
+                # if send_reply_outcome.get("needs_user_action"): # Handled by ensure_auth_and_call_tool
+                #     print(f"{user_interface.Fore.YELLOW}Gmail authentication might be required again.{user_interface.Style.RESET_ALL}")
+                return False
+
+        elif confirmation_choice == "save_draft":
+            print(f"{user_interface.Style.DIM}Preparing to save draft in Gmail...{user_interface.Style.RESET_ALL}")
+            recipient_for_draft = current_draft_info.get("recipient_email_for_reply") # Original sender
+            original_thread_id_for_draft = current_draft_info.get("original_thread_id")
+
+            if not recipient_for_draft or not draft_subject or not draft_body:
+                 print(f"{user_interface.Fore.RED}Critical draft information missing. Cannot save.{user_interface.Style.RESET_ALL}")
+                 return False
+            if not gmail_mcp_manager or not gmail_mcp_manager.session:
+                print(f"{user_interface.Fore.RED}Gmail MCP session not available. Cannot save draft.{user_interface.Style.RESET_ALL}")
+                return False
+
+            create_draft_outcome = await gmail_mcp_manager.create_gmail_draft(
+                recipient_email=recipient_for_draft,
+                subject=draft_subject, # Use the LLM generated subject
+                body=draft_body,
+                thread_id=original_thread_id_for_draft # So it's a reply draft
+            )
+            if create_draft_outcome.get("successful"):
+                print(f"{user_interface.Fore.GREEN}Success! {create_draft_outcome.get('message', 'Draft saved.')}{user_interface.Style.RESET_ALL}")
+                print(f"{user_interface.Fore.YELLOW}Please review the draft in your Gmail account.{user_interface.Style.RESET_ALL}")
+                return True
+            else:
+                error_msg = create_draft_outcome.get('error', 'Failed to save draft via MCP.')
+                print(f"{user_interface.Fore.RED}MCP Error: {error_msg}{user_interface.Style.RESET_ALL}")
+                return False
+
+        elif confirmation_choice == "edit":
+            user_edit_instructions = user_interface.get_user_input(f"{user_interface.Fore.CYAN}Your edit instructions (or type your full new draft):{user_interface.Style.RESET_ALL}")
+            print(f"{user_interface.Style.DIM}Re-drafting with your instructions...{user_interface.Style.RESET_ALL}")
+            current_draft_info = await llm_processor.draft_email_reply_with_llm(
+                gemini_llm_model,
+                chosen_email_data['original_email_data'],
+                initial_llm_action_text,
+                user_persona,
+                user_priorities,
+                user_edit_instructions=user_edit_instructions
+            )
+            # Loop continues to show new draft
+
+        elif confirmation_choice == "cancel":
+            print(f"{user_interface.Fore.YELLOW}Drafting and replying cancelled.{user_interface.Style.RESET_ALL}")
+            return True
+
+        else:
+            print(f"{user_interface.Fore.RED}Unknown confirmation choice.{user_interface.Style.RESET_ALL}")
+            return False
+
+# ... (rest of assistant.py, especially main_assistant_entry, remains the same for now) ...
+# The logic in main_assistant_entry that calls handle_draft_email_reply is fine.
 
 async def main_assistant_entry():
     """Entry point for the assistant logic."""
@@ -317,7 +435,7 @@ async def main_assistant_entry():
     google_api_key = config_manager.DEV_CONFIG.get(config_manager.ENV_GOOGLE_API_KEY)
     try:
         genai.configure(api_key=google_api_key)
-        gemini_llm_model = genai.GenerativeModel('gemini-1.5-flash-latest') # Updated model
+        gemini_llm_model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20') # Updated model
         print(f"{user_interface.Fore.GREEN}Gemini model initialized successfully.{user_interface.Style.RESET_ALL}")
     except Exception as e:
         print(f"{user_interface.Fore.RED}Failed to initialize Gemini model: {e}{user_interface.Style.RESET_ALL}")

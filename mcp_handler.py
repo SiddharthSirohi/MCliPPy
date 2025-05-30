@@ -5,8 +5,10 @@ import traceback
 import sys
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+from typing import Dict, List, Optional, Any, Tuple
 
 import config_manager
+import user_interface
 
 COMPOSIO_AUTH_INIT_TOOL = "COMPOSIO_INITIATE_CONNECTION"
 
@@ -166,3 +168,135 @@ class McpSessionManager:
             if "Method not found" in str(e) and COMPOSIO_AUTH_INIT_TOOL in str(e): # Highly unlikely
                  print(f"MCP_SM ({self.app_name}): Auth tool itself not found, check MCP server config.")
             return {"error": str(e), "exception": True}
+
+    async def reply_to_gmail_thread(
+        self,
+        thread_id: str,
+        recipient_email: str, # This is the original sender
+        message_body: str,
+        # cc_emails: Optional[List[str]] = None, # Future enhancement
+        # bcc_emails: Optional[List[str]] = None  # Future enhancement
+    ) -> Dict[str, Any]:
+        """
+        Uses Composio's GMAIL_REPLY_TO_THREAD tool (assuming this is the slug).
+        Returns a dictionary with success/error.
+        """
+        if not self.session:
+            return {"error": "No active Gmail MCP session.", "successful": False}
+
+        # PM: We need to confirm the exact slug for "Action to reply to an email thread in gmail"
+        # Let's assume it's 'GMAIL_REPLY_TO_THREAD' for now.
+        # This should be fetched from self.tools ideally or confirmed from Composio dashboard.
+        tool_name = "GMAIL_REPLY_TO_THREAD" # Placeholder - VERIFY THIS SLUG!
+
+        # Check if this tool is actually available from the list fetched from Composio
+        if tool_name not in self.tools:
+            # Fallback or error if direct reply tool isn't available
+            # For now, let's try to create a draft as a fallback if reply tool is missing.
+            # This shows resilience, a good PM trait.
+            print(f"{user_interface.Fore.YELLOW}MCP_SM (gmail): Tool '{tool_name}' not found. Attempting to create a draft instead.{user_interface.Style.RESET_ALL}")
+            # We need subject for create_draft. We can try to get it or just use a generic one.
+            # For simplicity, let's say draft creation for reply also needs the original subject.
+            # This part would need the original subject if we go the draft route.
+            # For now, let's just signal that direct reply isn't available.
+            return {
+                "error": f"Tool '{tool_name}' not available. Direct reply failed. Consider implementing 'Save as Draft'.",
+                "successful": False
+            }
+
+
+        params = {
+            "thread_id": thread_id,
+            "recipient_email": recipient_email, # The original sender becomes the recipient of the reply
+            "message_body": message_body,
+            "is_html": False # Assuming plain text
+            # "user_id": "me" # Defaults to "me"
+        }
+        # if cc_emails: params["cc"] = cc_emails
+        # if bcc_emails: params["bcc"] = bcc_emails
+
+        print(f"MCP_SM (gmail): Attempting to call tool '{tool_name}' with"
+              f" ThreadID='{thread_id}', Recipient='{recipient_email}'")
+
+        reply_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, params)
+
+        if isinstance(reply_result_from_mcp, dict) and reply_result_from_mcp.get("needs_user_action"):
+            return reply_result_from_mcp
+        if isinstance(reply_result_from_mcp, dict) and reply_result_from_mcp.get("error"):
+            return {
+                "error": reply_result_from_mcp.get("error", f"Unknown error calling {tool_name}"),
+                "successful": False,
+                "needs_user_action": reply_result_from_mcp.get("needs_user_action", False)
+            }
+
+        if reply_result_from_mcp and hasattr(reply_result_from_mcp, 'content') and reply_result_from_mcp.content:
+            text_content = getattr(reply_result_from_mcp.content[0], 'text', None)
+            if text_content:
+                try:
+                    composio_response = json.loads(text_content)
+                    if composio_response.get("successful"):
+                        # The "data" from "reply to thread" might not have a specific ID like a draft,
+                        # but it indicates success.
+                        print(f"{user_interface.Fore.GREEN}Successfully replied to Gmail thread (Thread ID: {thread_id}).{user_interface.Style.RESET_ALL}")
+                        return {"successful": True, "message": f"Successfully replied to thread ID: {thread_id}."}
+                    else:
+                        error_msg = composio_response.get("error", f"Failed to reply to thread, Composio tool reported not successful.")
+                        print(f"{user_interface.Fore.RED}{error_msg}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": error_msg}
+                except json.JSONDecodeError:
+                    return {"successful": False, "error": f"Could not parse {tool_name} response from Composio."}
+
+        return {"successful": False, "error": f"Unexpected or empty response from {tool_name}."}
+
+    async def create_gmail_draft(self, recipient_email: str, subject: str, body: str, thread_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Uses Composio's GMAIL_CREATE_DRAFT tool.
+        Returns a dictionary with success/error and potentially draft_id.
+        """
+        # ... (this function remains largely the same as before, but it's now a distinct action) ...
+        if not self.session:
+            return {"error": "No active Gmail MCP session.", "successful": False}
+
+        tool_name = "GMAIL_CREATE_DRAFT" # This slug is confirmed
+        if tool_name not in self.tools:
+            return {"error": f"Tool '{tool_name}' not available in cached tools for Gmail.", "successful": False}
+
+        params = {
+            "recipient_email": recipient_email,
+            "subject": subject,
+            "body": body,
+            "is_html": False
+        }
+        if thread_id:
+            params["thread_id"] = thread_id
+
+        print(f"MCP_SM (gmail): Attempting to call tool '{tool_name}' (Save as Draft) with params: Subject='{subject}', Recipient='{recipient_email}', ThreadID='{thread_id}'")
+
+        draft_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, params)
+
+        if isinstance(draft_result_from_mcp, dict) and draft_result_from_mcp.get("needs_user_action"):
+            return draft_result_from_mcp
+        if isinstance(draft_result_from_mcp, dict) and draft_result_from_mcp.get("error"):
+            return {
+                "error": draft_result_from_mcp.get("error", f"Unknown error calling {tool_name}"),
+                "successful": False,
+                "needs_user_action": draft_result_from_mcp.get("needs_user_action", False)
+            }
+
+        if draft_result_from_mcp and hasattr(draft_result_from_mcp, 'content') and draft_result_from_mcp.content:
+            text_content = getattr(draft_result_from_mcp.content[0], 'text', None)
+            if text_content:
+                try:
+                    composio_response = json.loads(text_content)
+                    if composio_response.get("successful"):
+                        draft_id = composio_response.get("data", {}).get("response_data", {}).get("id")
+                        print(f"{user_interface.Fore.GREEN}Successfully created Gmail draft (ID: {draft_id}).{user_interface.Style.RESET_ALL}")
+                        return {"successful": True, "draft_id": draft_id, "message": f"Draft created successfully (ID: {draft_id})."}
+                    else:
+                        error_msg = composio_response.get("error", f"Failed to create draft, Composio tool reported not successful.")
+                        print(f"{user_interface.Fore.RED}{error_msg}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": error_msg}
+                except json.JSONDecodeError:
+                    return {"successful": False, "error": "Could not parse GMAIL_CREATE_DRAFT response from Composio."}
+
+        return {"successful": False, "error": f"Unexpected or empty response from {tool_name}."}
