@@ -128,83 +128,116 @@ def display_calendar_event_summary(index: int, event_data: Dict[str, Any]):
             print(f"     {Style.BRIGHT}{Fore.GREEN}({chr(97 + i)}){Style.RESET_ALL} {action_text}")
     print("-" * 10)
 
+# user_interface.py
 def display_processed_data_and_get_action(
     important_emails_llm: List[Dict[str, Any]],
-    processed_events_llm: List[Dict[str, Any]]
-) -> Optional[Tuple[str, int, int]]: # type, item_index, action_index
+    processed_events_llm: List[Dict[str, Any]],
+    first_time_display: bool = True # New parameter
+) -> Optional[Tuple[str, int, int, str]]: # type, item_idx, action_idx, raw_user_choice
     """
     Displays summarized emails and events, then prompts for action.
     Returns:
-        - ("email", email_idx, action_idx)
-        - ("event", event_idx, action_idx)
-        - ("skip", -1, -1) if user wants to skip
-        - ("quit", -1, -1) if user wants to quit
+        - ("email", email_idx, action_idx, raw_choice)
+        - ("event", event_idx, action_idx, raw_choice)
+        - ("done", -1, -1, "d") if user wants to finish with this set of items
+        - ("quit_assistant", -1, -1, "q") if user wants to quit the whole assistant
         - None if no actionable items or invalid input format after trying
-    PM Consideration: Clear separation of concerns. This function displays and gets choice.
-    The actual execution of the choice happens elsewhere.
-    Provide clear instructions to the user.
     """
     actionable_items_present = False
+    if first_time_display: # Only print headers and full lists the first time in a cycle
+        if important_emails_llm:
+            print_header("Important Emails")
+            for i, email_data in enumerate(important_emails_llm):
+                display_email_summary(i + 1, email_data)
+            actionable_items_present = True
+        else:
+            print(f"{Fore.GREEN}No new important emails requiring immediate attention.{Style.RESET_ALL}")
 
-    if important_emails_llm:
-        print_header("Important Emails")
-        for i, email_data in enumerate(important_emails_llm):
-            display_email_summary(i + 1, email_data)
-        actionable_items_present = True
-    else:
-        print(f"{Fore.GREEN}No new important emails requiring immediate attention.{Style.RESET_ALL}")
+        if processed_events_llm:
+            print_header("Upcoming Calendar Events")
+            for i, event_data in enumerate(processed_events_llm):
+                if event_data.get('suggested_actions'):
+                    display_calendar_event_summary(len(important_emails_llm) + i + 1, event_data)
+                    actionable_items_present = True
+        else:
+            print(f"{Fore.GREEN}No upcoming events with specific suggestions.{Style.RESET_ALL}")
 
-    if processed_events_llm:
-        print_header("Upcoming Calendar Events")
-        for i, event_data in enumerate(processed_events_llm):
-            # PM: Only show events that have LLM-suggested actions to keep it focused.
-            if event_data.get('suggested_actions'):
-                display_calendar_event_summary(len(important_emails_llm) + i + 1, event_data)
-                actionable_items_present = True
-    else:
-        print(f"{Fore.GREEN}No upcoming events with specific suggestions.{Style.RESET_ALL}")
+        if not actionable_items_present:
+            print(f"\n{Fore.GREEN}All caught up for now!{Style.RESET_ALL}")
+            return None
+    elif not important_emails_llm and not any(e.get('suggested_actions') for e in processed_events_llm):
+        # If, after an action, there are no more items (e.g., last item was deleted)
+        print(f"\n{Fore.GREEN}No more actionable items in this cycle.{Style.RESET_ALL}")
+        return ("done", -1, -1, "d")
 
-    if not actionable_items_present:
-        print(f"\n{Fore.GREEN}All caught up for now!{Style.RESET_ALL}")
-        return None # No actions to take
 
-    print(f"\n{Style.BRIGHT}Enter your choice (e.g., '1a' for action 'a' on item '1', 's' to skip, 'q' to quit cycle):{Style.RESET_ALL}")
+    print(f"\n{Style.BRIGHT}Choose an action (e.g., '1a'), or type:"
+          f"\n  '{Fore.YELLOW}d{Style.RESET_ALL}{Style.BRIGHT}' when done with actions for this cycle,"
+          f"\n  '{Fore.YELLOW}r{Style.RESET_ALL}{Style.BRIGHT}' to refresh/re-display items,"
+          f"\n  '{Fore.YELLOW}q{Style.RESET_ALL}{Style.BRIGHT}' to quit assistant:{Style.RESET_ALL}")
 
-    # PM: Simple input validation. Could be more robust with regex.
     user_choice_str = input(f"{Fore.CYAN}> {Style.RESET_ALL}").strip().lower()
 
-    if user_choice_str == 's' or user_choice_str == 'skip':
-        return "skip", -1, -1
-    if user_choice_str == 'q' or user_choice_str == 'quit':
-        return "quit", -1, -1
+    if user_choice_str in ['d', 'done']:
+        return "done", -1, -1, user_choice_str
+    if user_choice_str in ['q', 'quit']:
+        return "quit_assistant", -1, -1, user_choice_str
+    if user_choice_str in ['r', 'refresh', 'redisplay']:
+        return "redisplay", -1, -1, user_choice_str
+
 
     if len(user_choice_str) >= 2 and user_choice_str[:-1].isdigit() and user_choice_str[-1].isalpha():
         item_num_chosen = int(user_choice_str[:-1])
         action_char_chosen = user_choice_str[-1]
         action_idx_chosen = ord(action_char_chosen) - ord('a')
 
-        # Determine if it's an email or event
         if 1 <= item_num_chosen <= len(important_emails_llm):
             item_type = "email"
             actual_item_idx = item_num_chosen - 1
-            # Check if action_idx_chosen is valid for this email
             if 0 <= action_idx_chosen < len(important_emails_llm[actual_item_idx].get('suggested_actions', [])):
-                return item_type, actual_item_idx, action_idx_chosen
+                return item_type, actual_item_idx, action_idx_chosen, user_choice_str
             else:
                 print(f"{Fore.RED}Invalid action '{action_char_chosen}' for email {item_num_chosen}.{Style.RESET_ALL}")
-
+        # ... (event logic for choosing action, same as before, ensure it also returns user_choice_str)
         elif len(important_emails_llm) < item_num_chosen <= (len(important_emails_llm) + len(processed_events_llm)):
-            item_type = "event"
-            actual_item_idx = item_num_chosen - 1 - len(important_emails_llm)
-             # Check if action_idx_chosen is valid for this event
-            if 0 <= action_idx_chosen < len(processed_events_llm[actual_item_idx].get('suggested_actions', [])):
-                return item_type, actual_item_idx, action_idx_chosen
+            # Adjusting to correctly index into processed_events_llm which might have non-actionable items filtered out by display
+            # This needs care: the numbering presented to user must map back correctly.
+            # For simplicity, let's assume processed_events_llm only contains actionable events for display indexing.
+            # This part needs careful alignment with how events are numbered and stored if some are filtered from display.
+            # For now, assuming display_calendar_event_summary was called for all in processed_events_llm that had actions.
+
+            # Let's filter processed_events_llm to only those that were displayed (had actions)
+            displayable_events = [e for e in processed_events_llm if e.get('suggested_actions')]
+
+            if len(important_emails_llm) < item_num_chosen <= (len(important_emails_llm) + len(displayable_events)):
+                item_type = "event"
+                # User's item_num_chosen is 1-based and global.
+                # actual_item_idx is 0-based for the displayable_events list.
+                actual_item_idx_in_displayable = item_num_chosen - 1 - len(important_emails_llm)
+
+                if 0 <= actual_item_idx_in_displayable < len(displayable_events):
+                    # We need to find this event in the original processed_events_llm list to get its original index
+                    # This is tricky if items were filtered. A safer way is to pass back the actual item or its original index.
+                    # For now, let's assume a direct mapping for simplicity, will need refinement if filtering display.
+                    # Simpler: find the original event data corresponding to this displayable event
+                    chosen_displayable_event = displayable_events[actual_item_idx_in_displayable]
+                    original_event_idx = -1
+                    for idx, orig_event in enumerate(processed_events_llm):
+                        # Assuming event IDs are unique and present from LLM
+                        if orig_event.get("original_event_data",{}).get("id") == chosen_displayable_event.get("original_event_data",{}).get("id"):
+                            original_event_idx = idx
+                            break
+
+                    if original_event_idx != -1 and 0 <= action_idx_chosen < len(chosen_displayable_event.get('suggested_actions', [])):
+                         return item_type, original_event_idx, action_idx_chosen, user_choice_str # Return original_event_idx
+                    else:
+                        print(f"{Fore.RED}Invalid action '{action_char_chosen}' for event {item_num_chosen} or event ID mismatch.{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.RED}Invalid selection for event {item_num_chosen}.{Style.RESET_ALL}")
             else:
-                print(f"{Fore.RED}Invalid action '{action_char_chosen}' for event {item_num_chosen}.{Style.RESET_ALL}")
-        else:
-            print(f"{Fore.RED}Invalid item number '{item_num_chosen}'.{Style.RESET_ALL}")
+                print(f"{Fore.RED}Invalid item number '{item_num_chosen}'.{Style.RESET_ALL}")
     else:
-        if user_choice_str: # Only print error if they typed something invalid, not if they just hit enter
+        if user_choice_str:
             print(f"{Fore.RED}Invalid input format. Use item number then action letter (e.g., '1a').{Style.RESET_ALL}")
 
     return None # Invalid input or no action
@@ -231,6 +264,157 @@ def get_send_edit_cancel_confirmation(draft_text: str, service_name: str = "emai
         if choice in ['c', 'cancel', '']: # Empty input defaults to cancel
             return "cancel"
         print(f"{Fore.RED}Invalid choice. Please enter S, E, or C.{Style.RESET_ALL}")
+
+def get_event_update_choices(original_event_summary: str, original_event_details: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    print_header(f"Update Event: {original_event_summary[:50]}...")
+    updates: Dict[str, Any] = {} # Ensure updates is always a dict
+
+    # Extract original start and timezone for later use if needed
+    original_start_iso = original_event_details.get("start", {}).get("dateTime")
+    original_event_timezone = original_event_details.get("start", {}).get("timeZone") # Google API often provides this
+
+    fields_to_update = {
+        "1": {"name": "Title (Summary)", "key": "summary", "type": "str"},
+        "2": {"name": "Start Datetime (YYYY-MM-DDTHH:MM:SS, local to event)", "key": "start_datetime", "type": "datetime_str"},
+        "3": {"name": "Duration (Hours, Minutes)", "key": "duration", "type": "duration"},
+        "4": {"name": "Description", "key": "description", "type": "str"},
+        "5": {"name": "Location", "key": "location", "type": "str"},
+        "6": {"name": "Attendees (comma-separated emails)", "key": "attendees", "type": "email_list"},
+        "7": {"name": "Google Meet Link (Add/Ensure)", "key": "create_meeting_room", "type": "bool_true"},
+    }
+
+    while True:
+        print("\nWhat would you like to update?")
+        for key_choice, val_info in fields_to_update.items():
+            current_val_indicator = ""
+            if val_info['key'] in updates:
+                current_val_indicator = f" (current: {Fore.YELLOW}{updates[val_info['key']]}{Style.RESET_ALL})"
+            elif val_info['key'] == "create_meeting_room" and updates.get("create_meeting_room") is True: # Specifically for bool_true
+                 current_val_indicator = f" (current: {Fore.YELLOW}True{Style.RESET_ALL})"
+            elif val_info['key'] == "duration" and ("event_duration_hour" in updates or "event_duration_minutes" in updates):
+                 current_val_indicator = f" (current: {Fore.YELLOW}{updates.get('event_duration_hour',0)}h {updates.get('event_duration_minutes',0)}m{Style.RESET_ALL})"
+            print(f"  {Style.BRIGHT}{key_choice}{Style.RESET_ALL}. {val_info['name']}{current_val_indicator}")
+
+        print(f"  {Style.BRIGHT}s{Style.RESET_ALL}. Save changes and proceed to update")
+        print(f"  {Style.BRIGHT}c{Style.RESET_ALL}. Cancel update")
+
+        choice = get_user_input("Choose field to edit, 's' to save, or 'c' to cancel").lower()
+
+        if choice == 'c': return None
+        if choice == 's':
+            if not updates:
+                print(f"{Fore.YELLOW}No changes made. Update cancelled.{Style.RESET_ALL}")
+                return None
+
+            # If ANY update is being made, ensure start_datetime, timezone, and duration are present
+            # because GOOGLECALENDAR_UPDATE_EVENT marks start_datetime as REQUIRED.
+            needs_base_timing_info = bool(updates)
+
+            if needs_base_timing_info:
+                # Ensure start_datetime is present
+                if "start_datetime" not in updates:
+                    if original_start_iso:
+                        try:
+                            dt_obj = datetime.fromisoformat(original_start_iso)
+                            updates["start_datetime"] = dt_obj.strftime("%Y-%m-%dT%H:%M:%S") # Naive
+                        except ValueError:
+                            print(f"{Fore.RED}Original event start time '{original_start_iso}' is invalid. Update cannot proceed without a valid start time.{Style.RESET_ALL}")
+                            return None
+                    else:
+                        print(f"{Fore.RED}Error: Start Datetime is required for any update and original could not be found. Update cannot proceed.{Style.RESET_ALL}")
+                        return None
+
+                # Ensure timezone is present (goes with start_datetime)
+                if "timezone" not in updates:
+                    if original_event_timezone: # From event.start.timeZone
+                        updates["timezone"] = original_event_timezone
+                    elif original_start_iso: # Try to derive from full ISO string's offset if event.start.timeZone missing
+                        try:
+                            dt_obj_for_tz = datetime.fromisoformat(original_start_iso)
+                            if dt_obj_for_tz.tzinfo:
+                                # This gets offset like +05:30. Google API/Composio likely needs IANA.
+                                # For robustness, if original_event_timezone (IANA) isn't there, better to prompt or use a default.
+                                updates["timezone"] = get_user_input(f"Enter timezone for start time '{updates['start_datetime']}' (e.g., Asia/Kolkata)", default="UTC")
+                            else: # Naive original, prompt for TZ
+                                 updates["timezone"] = get_user_input(f"Enter timezone for start time '{updates['start_datetime']}' (e.g., Asia/Kolkata)", default="UTC")
+                        except ValueError: # Fallback to prompt
+                            updates["timezone"] = get_user_input(f"Enter timezone for start time '{updates['start_datetime']}' (e.g., Asia/Kolkata)", default="UTC")
+                    else: # Fallback to prompt
+                        updates["timezone"] = get_user_input(f"Enter timezone for start time '{updates.get('start_datetime', 'UNKNOWN')}' (e.g., Asia/Kolkata)", default="UTC")
+
+                # Ensure duration fields are present
+                if "event_duration_hour" not in updates and "event_duration_minutes" not in updates:
+                    original_end_iso = original_event_details.get("end", {}).get("dateTime")
+                    if original_start_iso and original_end_iso:
+                        try:
+                            orig_start_dt = datetime.fromisoformat(original_start_iso)
+                            orig_end_dt = datetime.fromisoformat(original_end_iso)
+                            duration_delta = orig_end_dt - orig_start_dt
+                            total_minutes = max(0, int(duration_delta.total_seconds() / 60))
+                            updates["event_duration_hour"] = total_minutes // 60
+                            updates["event_duration_minutes"] = total_minutes % 60
+                        except ValueError:
+                            updates["event_duration_hour"] = 0
+                            updates["event_duration_minutes"] = 30
+                    else:
+                        updates["event_duration_hour"] = 0
+                        updates["event_duration_minutes"] = 30
+            if "summary" not in updates and original_event_details.get("summary"):
+                updates["summary"] = original_event_details.get("summary")
+                print(f"   (DEBUG: Auto-added original summary '{updates['summary']}' to prevent loss)")
+
+            return updates
+
+        if choice in fields_to_update:
+            field_info = fields_to_update[choice]
+            field_key = field_info["key"]
+            field_type = field_info["type"]
+
+            if field_type == "str":
+                updates[field_key] = get_user_input(f"Enter new {field_info['name']}")
+            elif field_type == "datetime_str":
+                # PM: Add validation for YYYY-MM-DDTHH:MM:SS format
+                new_val = get_user_input(f"Enter new {field_info['name']} (YYYY-MM-DDTHH:MM:SS)")
+                # Basic validation example (can be more robust)
+                try:
+                    datetime.strptime(new_val, "%Y-%m-%dT%H:%M:%S")
+                    updates[field_key] = new_val
+                    # If start_datetime is naive, we should also prompt for timezone if not already set
+                    if "timezone" not in updates:
+                        tz = get_user_input("Enter Timezone (e.g., Asia/Kolkata, or press Enter for UTC if datetime has Z/offset)", default="UTC")
+                        if tz != "UTC" or "Z" not in new_val or "+" not in new_val: # Only set if needed
+                             updates["timezone"] = tz if tz else "UTC" # Default to UTC if empty
+                except ValueError:
+                    print(f"{Fore.RED}Invalid datetime format. Please use YYYY-MM-DDTHH:MM:SS{Style.RESET_ALL}")
+            elif field_type == "duration":
+                try:
+                    h = int(get_user_input("Enter new duration hours (0-23)", default="0"))
+                    m = int(get_user_input("Enter new duration minutes (0-59)", default="30"))
+                    if 0 <= h <= 23 and 0 <= m <= 59:
+                        updates["event_duration_hour"] = h
+                        updates["event_duration_minutes"] = m
+                    else:
+                        print(f"{Fore.RED}Invalid duration values.{Style.RESET_ALL}")
+                except ValueError:
+                    print(f"{Fore.RED}Duration must be numbers.{Style.RESET_ALL}")
+            elif field_type == "email_list": # For attendees
+                current_attendees_str = ", ".join(updates.get(field_key, [])) # Current is now list of strings
+                emails_str = get_user_input(f"Enter new {field_info['name']} (comma-separated emails)", default=current_attendees_str)
+                attendee_email_strings = [e.strip() for e in emails_str.split(',') if e.strip() and "@" in e]
+                updates[field_key] = attendee_email_strings # Store as list of strings
+                print(f"   (DEBUG: Attendees to be sent as list of strings: {updates[field_key]})")
+            elif field_type == "bool_true":
+                print(f"DEBUG: Prompting for {field_info['name']}")
+                if get_yes_no_input(f"Set {field_info['name']} to True (create/ensure Meet link)?", default_yes=updates.get(field_key, True)):
+                    updates[field_key] = True
+                    print(f"   (DEBUG: {field_key} set to True in updates dict)")
+                else:
+                    if field_key in updates:
+                        del updates[field_key]
+                    print(f"   (DEBUG: {field_key} will not be sent or set to false by default by API)")
+
+        else:
+            print(f"{Fore.RED}Invalid choice.{Style.RESET_ALL}")
 
 if __name__ == "__main__":
     print("--- Testing user_interface.py ---")

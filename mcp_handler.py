@@ -118,6 +118,7 @@ class McpSessionManager:
             return {"error": f"No active MCP session for {self.app_name}.", "needs_reconnect": True}
 
         print(f"MCP_SM ({self.app_name}): Attempting to call tool '{tool_name}' with params {params}...")
+        print(f"MCP_SM ({self.app_name}): FINAL PARAMS BEING SENT TO SDK's call_tool for '{tool_name}': {json.dumps(params, indent=2)}") # ADD THIS LINE
         try:
             tool_result = await self.session.call_tool(tool_name, params)
 
@@ -315,3 +316,115 @@ class McpSessionManager:
 
 
         return {"successful": False, "error": f"Unexpected or empty response from {tool_name} after checking content."}
+
+    async def update_calendar_event(self, event_id: str, calendar_id: str = "primary", updates: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Uses Composio's GOOGLECALENDAR_UPDATE_EVENT tool.
+        'updates' dict should contain fields to change, e.g.,
+        {"summary": "New Title", "start_datetime": "2025-06-01T10:00:00", "timezone": "Asia/Kolkata"}
+        """
+        if not self.session:
+            return {"error": "No active Calendar MCP session.", "successful": False}
+
+        tool_name = "GOOGLECALENDAR_UPDATE_EVENT"
+        if tool_name not in self.tools:
+            print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Tool '{tool_name}' not available.{user_interface.Style.RESET_ALL}")
+            return {"error": f"Tool '{tool_name}' not available.", "successful": False}
+
+        if not updates: # If no updates provided, nothing to do
+            return {"error": "No updates provided for the event.", "successful": False}
+
+        params = {"event_id": event_id, "calendar_id": calendar_id}
+        valid_update_keys = [
+                    "summary", "start_datetime", "event_duration_hour", "event_duration_minutes",
+                    "description", "location", "attendees", "create_meeting_room", "timezone",
+                    "transparency", "visibility", "guests_can_modify", "guestsCanInviteOthers", "guestsCanSeeOtherGuests",
+                    "recurrence" # Add other valid keys from the CSV as needed
+                ]
+
+        actual_params_to_send = params.copy() # Start with event_id and calendar_id
+        for key, value in updates.items():
+            if key in valid_update_keys:
+                actual_params_to_send[key] = value
+            else:
+                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Ignoring unknown update key '{key}' for tool '{tool_name}'.{user_interface.Style.RESET_ALL}")
+
+        # Remove event_id and calendar_id from 'updates' dict for cleaner logging of just changes
+        updates_for_logging = {k:v for k,v in actual_params_to_send.items() if k not in ['event_id', 'calendar_id']}
+
+
+            # Parameter sanity checks based on CSV
+        if "start_datetime" in actual_params_to_send:
+                if not isinstance(actual_params_to_send["start_datetime"], str) or "T" not in actual_params_to_send["start_datetime"]:
+                     print(f"{user_interface.Fore.RED}Error: start_datetime for update must be YYYY-MM-DDTHH:MM:SS, got {actual_params_to_send['start_datetime']}{user_interface.Style.RESET_ALL}")
+                     return {"error": "start_datetime must be YYYY-MM-DDTHH:MM:SS", "successful": False}
+        if "event_duration_minutes" in actual_params_to_send:
+            try:
+                minutes = int(actual_params_to_send["event_duration_minutes"])
+                if not (0 <= minutes <= 59): # Schema said 0-59
+                    print(f"{user_interface.Fore.RED}Error: event_duration_minutes must be 0-59, got {minutes}{user_interface.Style.RESET_ALL}")
+                    return {"error": "event_duration_minutes must be 0-59", "successful": False}
+            except ValueError:
+                print(f"{user_interface.Fore.RED}Error: event_duration_minutes must be an integer, got {actual_params_to_send['event_duration_minutes']}{user_interface.Style.RESET_ALL}")
+                return {"error": "event_duration_minutes must be an integer", "successful": False}
+
+        if "event_duration_hour" in actual_params_to_send:
+            try:
+                hours = int(actual_params_to_send["event_duration_hour"])
+                if not (0 <= hours <= 23): # Schema implied 0-24, but 24h usually means next day start. 0-23 is safer for duration part.
+                    print(f"{user_interface.Fore.RED}Error: event_duration_hour must be 0-23, got {hours}{user_interface.Style.RESET_ALL}")
+                    return {"error": "event_duration_hour must be 0-23", "successful": False}
+            except ValueError:
+                print(f"{user_interface.Fore.RED}Error: event_duration_hour must be an integer, got {actual_params_to_send['event_duration_hour']}{user_interface.Style.RESET_ALL}")
+                return {"error": "event_duration_hour must be an integer", "successful": False}
+           # Add more checks as needed
+
+        print(f"MCP_SM ({self.app_name}): Attempting to call '{tool_name}' for EventID='{event_id}' with updates: {updates_for_logging}")
+
+        update_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, actual_params_to_send)
+
+        # --- START DEBUGGING BLOCK ---
+        print(f"MCP_SM ({self.app_name}): Raw update_result_from_mcp for {tool_name}:")
+        if isinstance(update_result_from_mcp, dict): # If it's already an error dict from ensure_auth_and_call_tool
+            print(json.dumps(update_result_from_mcp, indent=2))
+        elif update_result_from_mcp and hasattr(update_result_from_mcp, 'content'):
+            print(f"  ToolCallResult.content: {update_result_from_mcp.content}")
+            if update_result_from_mcp.content:
+                first_item_text = getattr(update_result_from_mcp.content[0], 'text', None)
+                print(f"  First content item text: {first_item_text}")
+        elif update_result_from_mcp:
+            print(f"  ToolCallResult (other structure): {update_result_from_mcp}")
+        else:
+            print(f"  ToolCallResult was None or empty.")
+        # --- END DEBUGGING BLOCK ---
+
+            # Standard parsing of Composio's response wrapper
+            if isinstance(update_result_from_mcp, dict) and update_result_from_mcp.get("needs_user_action"):
+                return update_result_from_mcp
+            if isinstance(update_result_from_mcp, dict) and update_result_from_mcp.get("error"): # Error from ensure_auth_and_call_tool or Composio
+                return {"error": update_result_from_mcp.get("error", f"Unknown error calling {tool_name}"), "successful": False, "needs_user_action": update_result_from_mcp.get("needs_user_action", False)}
+
+            if update_result_from_mcp and hasattr(update_result_from_mcp, 'content') and update_result_from_mcp.content:
+                text_content = getattr(update_result_from_mcp.content[0], 'text', None)
+                if text_content:
+                    try:
+                        composio_response = json.loads(text_content)
+                        print(f"DEBUG: Parsed composio_response: {json.dumps(composio_response, indent=2)}") # <-- ADD THIS
+                        print(f"DEBUG: Type of composio_response.get('successful'): {type(composio_response.get('successful'))}, Value: {composio_response.get('successful')}") # <-- ADD THIS
+
+                        if composio_response.get("successful"):
+                            updated_event_data = composio_response.get("data", {}).get("response_data", {})
+                            print(f"{user_interface.Fore.GREEN}Successfully updated Calendar event (ID: {event_id}).{user_interface.Style.RESET_ALL}")
+                            return {"successful": True, "message": f"Event ID: {event_id} updated.", "updated_event_data": updated_event_data}
+                        else:
+                            error_msg = composio_response.get("error", f"Failed to update event, Composio tool reported not successful.")
+                            print(f"{user_interface.Fore.RED}{error_msg}{user_interface.Style.RESET_ALL}")
+                            return {"successful": False, "error": error_msg}
+                    except json.JSONDecodeError:
+                        return {"successful": False, "error": f"Could not parse {tool_name} response."}
+
+        # If ensure_auth_and_call_tool returned a ToolCallResult but it had no content,
+        # and was not an error dict, it implies the MCP call itself was okay but Composio didn't give data.
+        # For an update, we expect some confirmation or the updated event.
+            print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Unexpected or empty content from {tool_name} after tool call.{user_interface.Style.RESET_ALL}")
+            return {"successful": False, "error": f"Unexpected or empty response from {tool_name}."}

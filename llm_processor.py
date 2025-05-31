@@ -46,9 +46,26 @@ You are a highly efficient AI assistant for a user whose role is: '{user_persona
 Their key priorities are: '{user_priorities}'.
 
 You will be given a list of recent unread emails. Your tasks are:
-1. For EACH email, determine if it is "important" based on the user's role, priorities, and the email's content (sender, subject, preview).
-2. For EACH email deemed important, provide a concise 1-2 sentence summary.
-3. For EACH email deemed important, suggest 1-3 brief, actionable next steps or quick actions the user might want to take. Examples: "Draft a positive reply", "Draft a polite decline", "Acknowledge receipt", "Create a calendar event for follow-up on [date]", "Add to to-do list: [task]".
+
+Determine if each email is "important".
+For important emails, provide a concise 1-2 sentence summary.
+For important emails, suggest 1-3 brief, actionable next steps.
+The assistant has tools for:
+1. Replying to emails (e.g., "Draft a reply to confirm availability")
+2. Creating new calendar events (e.g., "Create calendar event: Meeting with X about Y")
+3. Updating existing calendar events (e.g., "Update event 'Team Sync' to add Google Meet", "Update event 'Project Briefing' to new time [YYYY-MM-DDTHH:MM:SS] based on this email")
+4. Deleting calendar events
+5. Finding free slots in the calendar
+If an email discusses changes to an existing meeting (e.g., rescheduling, changing attendees, location, adding a meeting link),
+try to identify the original meeting (by its title or time if mentioned) and suggest an "Update event..." action.
+Clearly state what part of the event should be updated and with what new information, if discernible from the email.
+
+If an email discusses changes to an existing meeting (e.g., rescheduling, changing attendees, location, adding a meeting link):
+    1. Try to identify the original meeting by its title or time if mentioned in the email.
+    2. Extract the proposed changes (e.g., new time, new attendees, request for a Meet link).
+    3. Suggest an action like: "Update event '[Original Event Title Guessed]' with changes: [Details of changes, e.g., start_time to YYYY-MM-DDTHH:MM:SS, add_attendee: x@y.com, create_google_meet: true]".
+    OR if the original event is unclear, suggest: "Follow up on email to clarify which event needs update for [details of changes]".
+
 
 Analyze the following emails:
 {email_details_str}
@@ -62,10 +79,10 @@ Each object should have the following keys:
 
 Example of a single object in the JSON array:
 {{
-  "email_id": "1971abc...",
-  "is_important": true,
-  "summary": "The sender wants to schedule an urgent meeting to discuss the Q3 roadmap.",
-  "suggested_actions": ["Draft 'confirm availability' reply", "Check calendar for next Tuesday", "Prepare Q3 notes"]
+"email_id": "xyz789",
+"is_important": true,
+"summary": "John wants to move the 'Project Alpha Sync' from 2 PM to 4 PM today.",
+"suggested_actions": ["Draft reply to John acknowledging request", "Update event 'Project Alpha Sync' start_datetime to today 4 PM", "Check calendar for conflicts at 4 PM"]
 }}
 
 Only include emails in your response that you have analyzed. If an email is not important, still include its object with "is_important": false.
@@ -174,31 +191,22 @@ Their key priorities are: '{user_priorities}'.
 
 You will be given a list of their upcoming calendar events from Google Calendar.
 Your tasks are:
-1. For EACH event, provide a very brief highlight or summary focusing on what's most relevant to the user.
-2. For EACH event, suggest 1-3 brief, actionable next steps or quick actions the user might want to take using their calendar tools.
+1. For EACH event, provide a very brief highlight or summary.
+2. For EACH event, suggest 1-3 brief, actionable next steps using calendar tools.
    The assistant has tools to:
      - Delete an event (e.g., "Cancel this meeting")
-     - Update an event (e.g., "Reschedule for tomorrow", "Change title to X", "Add [person@example.com] as attendee")
-     - Create a new event (e.g., "Schedule a follow-up for this")
-     - Find free time slots (e.g., "Find free time next week for this discussion")
+     - Update an event's details (e.g., title, time, description, attendees, add Google Meet) -> Suggest as "Update this event's details"
+     - Create a new event
+     - Find free time slots
 
-   Consider the event's nature. For example:
-   - If it's a meeting they organized: "Reschedule this meeting?", "Add agenda to description?", "Cancel this meeting?"
-   - If it's an FYI type event: "Acknowledge event", "Set a reminder" (though we don't have a tool for reminders yet, it's a valid thought for future).
-   - If an email context led to this calendar check, you might suggest creating a related event.
-
-DO NOT suggest generic advice like "prepare for your day" or "ensure you rest." Focus on concrete actions related to managing the calendar event itself or follow-ups.
+   Focus on concrete actions related to managing the calendar event itself or follow-ups.
+   Example suggestions: "Delete this event", "Update this event's details", "Schedule a 30-min follow-up".
 
 Analyze the following events:
 {event_details_str}
 
-Please format your response as a single JSON array, where each object in the array corresponds to an event you analyzed.
-Each object MUST have the following keys:
-- "event_id": (string) The ID of the event (from "ID: ...").
-- "summary_llm": (string) Your brief highlight/summary of the event.
-- "suggested_actions": (array of strings) A list of 1-3 suggested actions. These actions should be phrased so the user understands what will happen. Example: ["Delete this event", "Reschedule for tomorrow 2 PM", "Add agenda: Discuss Q3 planning"].
-
-Ensure the entire response is a valid JSON array.
+Please format your response as a single JSON array...
+Each object MUST have... "event_id", "summary_llm", "suggested_actions": [...]
 """
 
     processed_events = []

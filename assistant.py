@@ -432,6 +432,48 @@ async def handle_delete_calendar_event(
         print(f"{user_interface.Fore.YELLOW}Event deletion cancelled by user.{user_interface.Style.RESET_ALL}")
         return True # User cancelled, not a failure of the action itself
 
+async def handle_update_calendar_event(
+    chosen_event_data: Dict[str, Any],
+    user_config: Dict[str, Any], # For user_id, calendar_mcp_url
+    calendar_mcp_manager: McpSessionManager,
+    # llm_parsed_updates: Optional[Dict[str, Any]] = None # For when LLM suggests specific changes
+):
+    original_event_details = chosen_event_data.get("original_event_data", {})
+    event_id_to_update = original_event_details.get("id")
+    event_title = original_event_details.get("summary", "Unknown Event")
+
+    if not event_id_to_update:
+        print(f"{user_interface.Fore.RED}Error: Could not find Event ID for '{event_title}'. Cannot update.{user_interface.Style.RESET_ALL}")
+        return False
+
+    # For now, always go to manual update menu.
+    # Later, if llm_parsed_updates is rich, we can confirm those first.
+    updates_from_user = user_interface.get_event_update_choices(
+        event_title,
+        original_event_details # Pass the original event details
+    )
+
+    if not updates_from_user: # User cancelled or made no changes
+        print(f"{user_interface.Fore.YELLOW}Event update cancelled or no changes specified.{user_interface.Style.RESET_ALL}")
+        return True # User cancelled, not a failure
+
+    print(f"{user_interface.Style.DIM}Attempting to update calendar event '{event_title}'...{user_interface.Style.RESET_ALL}")
+
+    update_outcome = await calendar_mcp_manager.update_calendar_event(
+        event_id=event_id_to_update,
+        updates=updates_from_user
+    )
+
+    if update_outcome.get("successful"):
+        print(f"{user_interface.Fore.GREEN}Success! {update_outcome.get('message', f'Event {event_title} updated.')}{user_interface.Style.RESET_ALL}")
+        # updated_event_display = update_outcome.get("updated_event", {}) # If Composio returns full updated event
+        # print(f"Updated event details: {json.dumps(updated_event_display, indent=2)}")
+        return True
+    else:
+        error_msg = update_outcome.get('error', 'Failed to update event via MCP.')
+        print(f"{user_interface.Fore.RED}MCP Error: {error_msg}{user_interface.Style.RESET_ALL}")
+        return False
+
 
 async def main_assistant_entry():
     """Entry point for the assistant logic."""
@@ -442,12 +484,12 @@ async def main_assistant_entry():
     user_configuration = config_manager.load_user_config()
 
     if not user_configuration or not user_configuration.get(config_manager.USER_EMAIL_KEY):
-        user_configuration = run_signup_flow() # This now uses user_interface for prompts
+        user_configuration = run_signup_flow()
         if not (user_configuration and user_configuration.get(config_manager.USER_EMAIL_KEY)):
             print(f"{user_interface.Fore.RED}Signup was not completed successfully. Exiting.{user_interface.Style.RESET_ALL}")
             return
         print(f"\n{user_interface.Fore.GREEN}Initial setup complete. The assistant will now perform its first check.{user_interface.Style.RESET_ALL}")
-        user_configuration = config_manager.load_user_config() # Reload to be sure
+        user_configuration = config_manager.load_user_config()
 
     print(f"\n{user_interface.Fore.GREEN}Welcome back, {user_interface.Fore.YELLOW}{user_configuration.get(config_manager.USER_EMAIL_KEY)}{user_interface.Style.RESET_ALL}!")
     print(f"{user_interface.Style.DIM}Proactive Assistant starting...{user_interface.Style.RESET_ALL}")
@@ -455,118 +497,167 @@ async def main_assistant_entry():
     google_api_key = config_manager.DEV_CONFIG.get(config_manager.ENV_GOOGLE_API_KEY)
     try:
         genai.configure(api_key=google_api_key)
-        gemini_llm_model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20') # Updated model
+        gemini_llm_model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
         print(f"{user_interface.Fore.GREEN}Gemini model initialized successfully.{user_interface.Style.RESET_ALL}")
     except Exception as e:
         print(f"{user_interface.Fore.RED}Failed to initialize Gemini model: {e}{user_interface.Style.RESET_ALL}")
         traceback.print_exc()
         sys.exit("Could not initialize LLM. Exiting.")
 
-    # --- Main Interaction Loop (simplified for now) ---
-    # For now, we'll just run one check cycle and then allow one round of actions.
-    # Phase 7 will wrap this in a schedule.
+    # --- Outer loop for potentially multiple proactive check cycles ---
+    while True:
+        can_continue, emails_to_display, events_to_display = await perform_proactive_checks(
+            user_configuration, gemini_llm_model
+        )
 
-    can_continue, emails_to_display, events_to_display = await perform_proactive_checks(user_configuration, gemini_llm_model)
+        if not can_continue:
+            print(f"{user_interface.Fore.YELLOW}Exiting assistant due to required user action (e.g., authentication). Please re-run after completing the action.{user_interface.Style.RESET_ALL}")
+            break # Break outer assistant loop
 
-    if not can_continue:
-        print(f"{user_interface.Fore.YELLOW}Exiting assistant due to required user action (e.g., authentication). Please re-run after completing the action.{user_interface.Style.RESET_ALL}")
-        return
+        if not emails_to_display and not any(e.get('suggested_actions') for e in events_to_display if e): # Check if events_to_display has actionable items
+            print(f"\n{user_interface.Fore.GREEN}No actionable items found in this cycle.{user_interface.Style.RESET_ALL}")
+            if not user_interface.get_yes_no_input("Perform another full proactive check (y/N)?", default_yes=False):
+                print(f"{user_interface.Fore.YELLOW}Quitting assistant.{user_interface.Style.RESET_ALL}")
+                break # Quit outer assistant loop
+            else:
+                continue # Go to next iteration of outer while True loop (re-check)
 
-    if not emails_to_display and not events_to_display:
-        print(f"\n{user_interface.Fore.GREEN}No actionable items found in this cycle.{user_interface.Style.RESET_ALL}")
-        # In a scheduled version, we'd just wait for the next cycle.
-        return
+        # --- Inner loop for multiple actions on the CURRENTLY FETCHED items ---
+        first_display_of_items = True
+        while True:
+            action_choice_data = user_interface.display_processed_data_and_get_action(
+                emails_to_display,
+                events_to_display,
+                first_time_display=first_display_of_items
+            )
+            first_display_of_items = False
 
-    action_choice_data = user_interface.display_processed_data_and_get_action(emails_to_display, events_to_display)
+            if not action_choice_data:
+                if not emails_to_display and not any(e.get('suggested_actions') for e in events_to_display if e):
+                    break
+                else:
+                    print(f"{user_interface.Fore.YELLOW}Please try your selection again or choose 'd' (done), 'r' (redisplay), or 'q' (quit).{user_interface.Style.RESET_ALL}")
+                    continue
 
-    if action_choice_data:
-        action_type, item_idx, action_idx_in_llm_suggestions = action_choice_data
+            action_type, item_idx, action_idx_in_llm_suggestions, raw_choice = action_choice_data
 
-        if action_type == "skip":
-            print(f"{user_interface.Fore.YELLOW}Skipping actions for this cycle.{user_interface.Style.RESET_ALL}")
-        elif action_type == "quit":
-            print(f"{user_interface.Fore.YELLOW}Quitting interaction for this cycle.{user_interface.Style.RESET_ALL}")
-        elif action_type == "email":
-            chosen_email_data = emails_to_display[item_idx]
-            chosen_llm_action_text = chosen_email_data['suggested_actions'][action_idx_in_llm_suggestions]
-            print(f"\n{user_interface.Style.BRIGHT}You chose to act on Email:{user_interface.Style.RESET_ALL}")
-            user_interface.display_email_summary(item_idx + 1, chosen_email_data) # Display it again for context
-            print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
-            # --- THIS IS THE NEW INTEGRATION POINT ---
-            if "draft" in chosen_llm_action_text.lower() or \
-               "reply" in chosen_llm_action_text.lower() or \
-               "confirm availability" in chosen_llm_action_text.lower() or \
-               "suggest an alternative time" in chosen_llm_action_text.lower(): # Make matching more robust
+            if action_type == "done":
+                print(f"{user_interface.Fore.YELLOW}Done with actions for this set of items.{user_interface.Style.RESET_ALL}")
+                break
+            elif action_type == "quit_assistant":
+                print(f"{user_interface.Fore.YELLOW}Quitting assistant.{user_interface.Style.RESET_ALL}")
+                return
+            elif action_type == "redisplay":
+                first_display_of_items = True
+                continue
 
-                gmail_mcp_url = user_configuration.get(config_manager.GMAIL_MCP_URL_KEY)
-                user_id = user_configuration.get(config_manager.USER_EMAIL_KEY)
+            action_succeeded_this_turn = False
+            gmail_mcp_url = user_configuration.get(config_manager.GMAIL_MCP_URL_KEY)
+            calendar_mcp_url = user_configuration.get(config_manager.CALENDAR_MCP_URL_KEY)
+            user_id = user_configuration.get(config_manager.USER_EMAIL_KEY)
 
-                if gmail_mcp_url and user_id:
-                    print(f"{user_interface.Style.DIM}Establishing Gmail session for action...{user_interface.Style.RESET_ALL}")
-                    # Create a new session manager instance specifically for this action.
-                    # This ensures a fresh connection if needed, especially if perform_proactive_checks closed its sessions.
-                    async with McpSessionManager(gmail_mcp_url, user_id, "gmail") as action_gmail_manager:
-                        if action_gmail_manager.session:
-                            action_succeeded = await handle_draft_email_reply(
-                                gemini_llm_model,
-                                chosen_email_data,
-                                chosen_llm_action_text, # This text becomes the 'action_sentiment'
-                                user_configuration,
-                                action_gmail_manager
-                            )
-                            if action_succeeded:
-                                print(f"{user_interface.Fore.GREEN}Email action completed.{user_interface.Style.RESET_ALL}")
+            if action_type == "email":
+                chosen_email_data = emails_to_display[item_idx]
+                chosen_llm_action_text = chosen_email_data['suggested_actions'][action_idx_in_llm_suggestions]
+                user_interface.print_header(f"Action on Email: {chosen_email_data['original_email_data'].get('subject', 'N/A')[:40]}...")
+                print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
+
+                if "draft" in chosen_llm_action_text.lower() or \
+                   "reply" in chosen_llm_action_text.lower() or \
+                   "confirm availability" in chosen_llm_action_text.lower() or \
+                   "suggest an alternative time" in chosen_llm_action_text.lower():
+                    if gmail_mcp_url and user_id:
+                        print(f"{user_interface.Style.DIM}Establishing Gmail session for action...{user_interface.Style.RESET_ALL}")
+                        async with McpSessionManager(gmail_mcp_url, user_id, "gmail-action") as action_gmail_manager: # Unique name for action manager
+                            if action_gmail_manager.session:
+                                action_succeeded_this_turn = await handle_draft_email_reply(
+                                    gemini_llm_model, chosen_email_data, chosen_llm_action_text,
+                                    user_configuration, action_gmail_manager
+                                )
                             else:
-                                print(f"{user_interface.Fore.RED}Email action did not complete successfully.{user_interface.Style.RESET_ALL}")
-                        else:
-                            print(f"{user_interface.Fore.RED}Could not establish Gmail session for the action.{user_interface.Style.RESET_ALL}")
+                                print(f"{user_interface.Fore.RED}Could not establish Gmail session for the action.{user_interface.Style.RESET_ALL}")
+                    else:
+                        print(f"{user_interface.Fore.RED}Gmail configuration (URL or User ID) missing.{user_interface.Style.RESET_ALL}")
                 else:
-                    print(f"{user_interface.Fore.RED}Gmail configuration (URL or User ID) missing. Cannot perform email action.{user_interface.Style.RESET_ALL}")
-            else:
-                # Fallback for other LLM suggested email actions not yet implemented
-                print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for email (ID: {chosen_email_data['original_email_data'].get('messageId')}) is not yet specifically implemented beyond drafting/replying.{user_interface.Style.RESET_ALL}")
+                    print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for email is not yet specifically implemented beyond drafting/replying.{user_interface.Style.RESET_ALL}")
 
-        elif action_type == "event":
-            chosen_event_data = events_to_display[item_idx]
-            chosen_llm_action_text = chosen_event_data['suggested_actions'][action_idx_in_llm_suggestions]
+            elif action_type == "event":
+                # Ensure events_to_display has valid items before indexing
+                displayable_events = [e for e in events_to_display if e and e.get('suggested_actions')]
+                if 0 <= item_idx < len(displayable_events): # item_idx should be index for displayable_events list
+                    # This mapping was complex. Let's simplify by getting the actual event object
+                    # The item_idx from display_processed_data_and_get_action IS ALREADY the correct
+                    # index into the original processed_events_llm IF we ensure the numbering is based on it.
+                    # The user_interface function's event indexing logic needs to be robust.
+                    # For now, assuming item_idx directly maps to processed_events_llm (after emails).
 
-            user_interface.print_header(f"Action on Event: {chosen_event_data['original_event_data'].get('summary', 'N/A')[:30]}...")
-            print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
+                    # Find the true chosen event data from the original list passed to display_processed_data
+                    true_event_index_in_original_list = item_idx # if item_idx from UI is already 0-based for events_to_display
 
-            # --- New Dispatch Logic for Calendar Actions ---
-            action_handled_successfully = False
-            if "delete" in chosen_llm_action_text.lower() or "cancel event" in chosen_llm_action_text.lower():
-                calendar_mcp_url = user_configuration.get(config_manager.CALENDAR_MCP_URL_KEY)
-                user_id = user_configuration.get(config_manager.USER_EMAIL_KEY)
-                if calendar_mcp_url and user_id:
-                    print(f"{user_interface.Style.DIM}Establishing Calendar session for delete action...{user_interface.Style.RESET_ALL}")
-                    async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action") as action_calendar_manager:
-                        if action_calendar_manager.session:
-                            action_handled_successfully = await handle_delete_calendar_event(
-                                chosen_event_data,
-                                user_configuration,
-                                action_calendar_manager
-                            )
+                    if 0 <= true_event_index_in_original_list < len(events_to_display):
+                        chosen_event_data = events_to_display[true_event_index_in_original_list]
+                        chosen_llm_action_text = chosen_event_data['suggested_actions'][action_idx_in_llm_suggestions]
+                        user_interface.print_header(f"Action on Event: {chosen_event_data['original_event_data'].get('summary', 'N/A')[:40]}...")
+                        print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
+
+                        if "update this event's details" in chosen_llm_action_text.lower() or \
+                                           "reschedule" in chosen_llm_action_text.lower() or \
+                                           "change title" in chosen_llm_action_text.lower() or \
+                                           "add attendee" in chosen_llm_action_text.lower() or \
+                                           "add google meet" in chosen_llm_action_text.lower(): # Add more keywords
+
+                                            if calendar_mcp_url and user_id:
+                                                print(f"{user_interface.Style.DIM}Establishing Calendar session for update action...{user_interface.Style.RESET_ALL}")
+                                                async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-update") as action_calendar_manager:
+                                                    if action_calendar_manager.session:
+                                                        action_succeeded_this_turn = await handle_update_calendar_event(
+                                                            chosen_event_data,
+                                                            user_configuration,
+                                                            action_calendar_manager
+                                                        )
+
+                        elif "delete" in chosen_llm_action_text.lower() or "cancel this meeting" in chosen_llm_action_text.lower():
+                            if calendar_mcp_url and user_id:
+                                print(f"{user_interface.Style.DIM}Establishing Calendar session for delete action...{user_interface.Style.RESET_ALL}")
+                                async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-delete") as action_calendar_manager: # Unique name
+                                    if action_calendar_manager.session:
+                                        action_succeeded_this_turn = await handle_delete_calendar_event(
+                                            chosen_event_data, user_configuration, action_calendar_manager
+                                        )
+                                    else:
+                                        print(f"{user_interface.Fore.RED}Could not establish Calendar session for delete action.{user_interface.Style.RESET_ALL}")
+                            else:
+                                print(f"{user_interface.Fore.RED}Calendar config missing. Cannot delete event.{user_interface.Style.RESET_ALL}")
+                        # elif "create event" in chosen_llm_action_text.lower(): # TODO
+                        #     pass
                         else:
-                            print(f"{user_interface.Fore.RED}Could not establish Calendar session for delete action.{user_interface.Style.RESET_ALL}")
+                            print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for event is not yet implemented.{user_interface.Style.RESET_ALL}")
+                    else:
+                        print(f"{user_interface.Fore.RED}Internal error: Invalid event index after selection.{user_interface.Style.RESET_ALL}")
                 else:
-                    print(f"{user_interface.Fore.RED}Calendar config missing. Cannot delete event.{user_interface.Style.RESET_ALL}")
-
-            # elif "create event" in chosen_llm_action_text.lower() or "add to calendar" in chosen_llm_action_text.lower():
-                # await handle_create_calendar_event(...) # TODO Next
-                # action_handled_successfully = True
-
-            else:
-                print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for event (ID: {chosen_event_data['original_event_data'].get('id')}) is not yet specifically implemented.{user_interface.Style.RESET_ALL}")
-
-            if action_handled_successfully:
-                 print(f"{user_interface.Fore.GREEN}Calendar action processed.{user_interface.Style.RESET_ALL}")
-            else:
-                 print(f"{user_interface.Fore.YELLOW}Calendar action was not completed or not applicable.{user_interface.Style.RESET_ALL}")
+                    print(f"{user_interface.Fore.RED}Internal error: Invalid event index from UI choice.{user_interface.Style.RESET_ALL}")
 
 
-    print(f"\n{user_interface.Style.DIM}Assistant interaction finished for this cycle.{user_interface.Style.RESET_ALL}")
-    # In a scheduled version, this is where it would loop back to wait for `schedule.run_pending()`
+            if action_succeeded_this_turn:
+                print(f"{user_interface.Fore.GREEN}Action '{raw_choice}' processed successfully.{user_interface.Style.RESET_ALL}")
+                # PM: After a successful action, data might be stale.
+                # Forcing a redisplay of current (potentially stale) data. User can use 'r' for full refresh.
+                print(f"{user_interface.Style.DIM}Displaying current items. Use 'r' to fetch fresh data if needed.{user_interface.Style.RESET_ALL}")
+                # We don't set first_display_of_items = True here, so it just re-prompts for action on current data.
+            elif action_type in ["email", "event"]: # If it was an email/event action but it failed or wasn't handled
+                print(f"{user_interface.Fore.YELLOW}Action '{raw_choice}' was not fully completed or not applicable.{user_interface.Style.RESET_ALL}")
+
+            # Loop back to display_processed_data_and_get_action for another action on the same set of items
+
+        # This is the end of the inner "action loop" for the current set of fetched items
+        print(f"\n{user_interface.Style.DIM}Finished interacting with current set of proactive items.{user_interface.Style.RESET_ALL}")
+
+        if not user_interface.get_yes_no_input("Perform another full proactive check (y/N)?", default_yes=False):
+            print(f"{user_interface.Fore.YELLOW}Quitting assistant.{user_interface.Style.RESET_ALL}")
+            break # Break outer assistant loop (for multiple checks)
+        # else: continue to the next proactive check (next iteration of outer while True)
+
+    print(f"\n{user_interface.Style.DIM}Proactive Assistant session finished.{user_interface.Style.RESET_ALL}")
 
 if __name__ == "__main__":
     try:
@@ -574,8 +665,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print(f"\n{user_interface.Fore.YELLOW}Assistant stopped by user. Goodbye!{user_interface.Style.RESET_ALL}")
     except SystemExit as e:
-        # print(f"Assistant is exiting: {e}") # SystemExit often has no message or just the exit code
-        pass # Already handled by messages in code typically
+        pass
     except Exception as e:
         print(f"{user_interface.Fore.RED}An unexpected error occurred in the main execution: {e}{user_interface.Style.RESET_ALL}")
         traceback.print_exc()
