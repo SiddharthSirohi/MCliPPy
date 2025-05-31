@@ -121,58 +121,86 @@ Ensure the entire response is a valid JSON array.
     return processed_emails
 
 # --- Calendar Event Processing ---
-async def process_calendar_events_with_llm(gemini_llm_model, events_data: list, user_persona: str, user_priorities: str):
+async def process_calendar_events_with_llm(
+    gemini_llm_model,
+    events_data: list,
+    user_persona: str,
+    user_priorities: str,
+    user_config: Dict[str, Any]
+):
     if not events_data:
         return []
+
     prompt_event_parts = []
     for i, event in enumerate(events_data):
         summary = event.get("summary", "No Title")
+        event_id = event.get("id", "N/A") # Make sure to include event ID
         start_time = event.get("start", {}).get("dateTime", "No Start Time")
         end_time = event.get("end", {}).get("dateTime", "No End Time")
-        description = event.get("description", "No description")[:200]
+        description_snippet = event.get("description", "No description")[:150] # Shorter snippet for this prompt
         location = event.get("location", "No location")
+        attendees_list = event.get("attendees", [])
+        attendees_emails = [
+            att.get("email") for att in attendees_list
+            if isinstance(att, dict) and att.get("email") and not att.get("resource", False) # Exclude resource calendars
+        ]
+        # Filter out the user's own email if present among attendees for brevity in prompt
+        user_main_email = user_config.get(config_manager.USER_EMAIL_KEY) # Assuming user_config is accessible or passed
+        if user_main_email and user_main_email in attendees_emails:
+            attendees_emails.remove(user_main_email)
 
-        attendees_list = event.get("attendees")
-        attendees_actual_emails = []
-        if isinstance(attendees_list, list): # Ensure attendees_list is a list before iterating
-            attendees_actual_emails = [att.get("email") for att in attendees_list
-                                       if isinstance(att, dict) and att.get("email")]
+        attendees_str = f"Attendees: {', '.join(attendees_emails[:3])}{'...' if len(attendees_emails) > 3 else ''}" if attendees_emails else "Attendees: Just you"
 
-        attendees_str = ', '.join(attendees_actual_emails) if attendees_actual_emails else 'None listed'
 
         prompt_event_parts.append(
-            f"Event {i+1}:\n"
-            f"ID: {event.get('id', 'N/A')}\n"
-            f"Title: {summary}\n"
-            f"Start: {start_time}\n"
-            f"End: {end_time}\n"
-            f"Location: {location}\n"
-            f"Attendees: {attendees_str}\n" # Use the processed string
-            f"Description Snippet: {description}\n---\n"
+            f"Event {i+1} (ID: {event_id}):\n" # Include ID clearly
+            f"  Title: {summary}\n"
+            f"  Start: {start_time}\n"
+            f"  End: {end_time}\n"
+            # f"  Location: {location}\n" # Optional for brevity here
+            # f"  {attendees_str}\n" # Optional for brevity here
+            f"  Description Snippet: {description_snippet}\n---\n"
         )
+
     if not prompt_event_parts:
-        print("LLM_PROCESSOR: No event content to process.")
+        print("LLM_PROCESSOR (Calendar): No event content to process for LLM.")
         return []
     event_details_str = "\n".join(prompt_event_parts)
 
+    # --- MODIFIED SYSTEM PROMPT ---
     system_prompt = f"""
 You are a highly efficient AI assistant for a user whose role is: '{user_persona}'.
 Their key priorities are: '{user_priorities}'.
 
-You will be given a list of upcoming calendar events. Your tasks are:
+You will be given a list of their upcoming calendar events from Google Calendar.
+Your tasks are:
 1. For EACH event, provide a very brief highlight or summary focusing on what's most relevant to the user.
-2. For EACH event, suggest 1-2 brief, actionable next steps or quick actions. Examples: "Prepare agenda points", "Confirm attendance (if RSVP needed and tool exists)", "Set reminder 15 mins prior", "Check related documents for [topic]".
+2. For EACH event, suggest 1-3 brief, actionable next steps or quick actions the user might want to take using their calendar tools.
+   The assistant has tools to:
+     - Delete an event (e.g., "Cancel this meeting")
+     - Update an event (e.g., "Reschedule for tomorrow", "Change title to X", "Add [person@example.com] as attendee")
+     - Create a new event (e.g., "Schedule a follow-up for this")
+     - Find free time slots (e.g., "Find free time next week for this discussion")
+
+   Consider the event's nature. For example:
+   - If it's a meeting they organized: "Reschedule this meeting?", "Add agenda to description?", "Cancel this meeting?"
+   - If it's an FYI type event: "Acknowledge event", "Set a reminder" (though we don't have a tool for reminders yet, it's a valid thought for future).
+   - If an email context led to this calendar check, you might suggest creating a related event.
+
+DO NOT suggest generic advice like "prepare for your day" or "ensure you rest." Focus on concrete actions related to managing the calendar event itself or follow-ups.
 
 Analyze the following events:
 {event_details_str}
 
 Please format your response as a single JSON array, where each object in the array corresponds to an event you analyzed.
-Each object should have the following keys:
-- "event_id": (string) The ID of the event (e.g., from "ID: ...").
+Each object MUST have the following keys:
+- "event_id": (string) The ID of the event (from "ID: ...").
 - "summary_llm": (string) Your brief highlight/summary of the event.
-- "suggested_actions": (array of strings) A list of 1-2 suggested actions for this event.
+- "suggested_actions": (array of strings) A list of 1-3 suggested actions. These actions should be phrased so the user understands what will happen. Example: ["Delete this event", "Reschedule for tomorrow 2 PM", "Add agenda: Discuss Q3 planning"].
+
 Ensure the entire response is a valid JSON array.
 """
+
     processed_events = []
     response_text_for_debugging = "Gemini call did not occur or failed before response was received."
     try:
@@ -219,12 +247,7 @@ Ensure the entire response is a valid JSON array.
              processed_events.append({"original_event_data": original_event_data, "summary_llm": "LLM API call error.", "suggested_actions": []})
     return processed_events
 
-# llm_processor.py
 
-# ... (other imports: genai, json, traceback, asyncio, config_manager) ...
-# ... (process_emails_with_llm and process_calendar_events_with_llm functions remain the same) ...
-
-# llm_processor.py
 async def draft_email_reply_with_llm(
     gemini_llm_model,
     original_email_data: Dict[str, Any],
@@ -399,10 +422,8 @@ async def _test_llm_processor():
         return
 
     try:
-        # EXPLICITLY CONFIGURE GENAI with the key loaded by config_manager
         print(f"Configuring Gemini with API key: {'********' if google_api_key_from_config else 'None'}")
         genai.configure(api_key=google_api_key_from_config)
-
         model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
         print("Gemini model initialized successfully.")
     except Exception as e:
@@ -410,16 +431,25 @@ async def _test_llm_processor():
         traceback.print_exc()
         return
 
-    # ... (rest of the mock data and test calls for emails and calendar) ...
-    # (This part remains the same as the previous version)
+    mock_persona = "Product Manager focused on new feature development and team coordination."
+    mock_priorities = "Client feedback, project deadlines, team blockers, and innovative ideas."
+
+    # --- Mock user_config for testing process_calendar_events_with_llm ---
+    mock_user_config_for_test = {
+        config_manager.USER_EMAIL_KEY: "test_user@example.com", # Provide a mock email
+        # Add other keys if process_calendar_events_with_llm were to use them, but it only needs USER_EMAIL_KEY for now
+    }
+    # --- End of mock user_config ---
+
+
+    # ... (mock_emails_data_from_tool and processing mock emails - this part is fine) ...
     mock_emails_data_from_tool = {"data": {"messages": [
         {"messageId": "email123", "snippet": "Q3 budget deadline approaching next Friday.", "messageText": "Team, quick reminder that the Q3 budget deadline is fast approaching next Friday. Please ensure all submissions are in by EOD Thursday.", "payload": {"headers": [{"name": "Subject", "value": "URGENT: Budget Deadline"}, {"name": "From", "value": "Boss <boss@example.com>"}]}},
         {"messageId": "email456", "snippet": "Team lunch tomorrow to celebrate!", "messageText": "Hey everyone, to celebrate the successful project launch, we're having a team lunch tomorrow at The Great Eatery at 1 PM. Hope to see you all there!", "payload": {"headers": [{"name": "Subject", "value": "Team Lunch!"}, {"name": "From", "value": "Friendly Colleague <colleague@example.com>"}]}},
         {"messageId": "email789", "snippet": "Your subscription to CloudServicePro is renewing soon.", "messageText": "This is a notification that your annual subscription to CloudServicePro will auto-renew on June 15th for $99.", "payload": {"headers": [{"name": "Subject", "value": "Subscription Renewal Notice"}, {"name": "From", "value": "CloudServicePro <billing@cloudservicepro.com>"}]}}
     ]}}
     actual_mock_emails = mock_emails_data_from_tool.get("data", {}).get("messages", [])
-    mock_persona = "Product Manager focused on new feature development and team coordination."
-    mock_priorities = "Client feedback, project deadlines, team blockers, and innovative ideas."
+
 
     if actual_mock_emails:
         print("\nProcessing mock emails...")
@@ -431,18 +461,25 @@ async def _test_llm_processor():
     else:
         print("No mock emails to process.")
 
+
     mock_calendar_events = [
-        {"id": "cal_event_1", "summary": "Project Phoenix Daily Standup", "start": {"dateTime": "2025-05-31T09:00:00-07:00"}, "end": {"dateTime": "2025-05-31T09:15:00-07:00"}, "attendees": [{"email":"dev1@example.com"}, {"email":"dev2@example.com"}]},
+        {"id": "cal_event_1", "summary": "Project Phoenix Daily Standup", "start": {"dateTime": "2025-05-31T09:00:00-07:00"}, "end": {"dateTime": "2025-05-31T09:15:00-07:00"}, "attendees": [{"email":"dev1@example.com"}, {"email":"dev2@example.com"}, {"email":"test_user@example.com"}]}, # Added test_user
         {"id": "cal_event_2", "summary": "Client Demo - Alpha Release", "start": {"dateTime": "2025-05-31T14:00:00-07:00"}, "end": {"dateTime": "2025-05-31T15:00:00-07:00"}, "description": "Showcase new features to Client X. Focus on UI improvements and performance gains.", "location": "ClientX HQ, Meeting Room 3"}
     ]
     if mock_calendar_events:
         print("\nProcessing mock calendar events...")
-        processed_events = await process_calendar_events_with_llm(model, mock_calendar_events, mock_persona, mock_priorities)
+        # Pass the mock_user_config_for_test
+        processed_events = await process_calendar_events_with_llm(
+            model,
+            mock_calendar_events,
+            mock_persona,
+            mock_priorities,
+            mock_user_config_for_test # <<< PASS THE MOCK CONFIG HERE
+        )
         print("\n--- Processed Calendar Events Output from LLM ---")
         for pe_cal in processed_events:
             print(json.dumps(pe_cal, indent=2))
             print("-" * 20)
-
 
 if __name__ == "__main__":
     asyncio.run(_test_llm_processor())

@@ -219,8 +219,8 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
                     time_max_str = (now_utc + timedelta(days=1)).isoformat().replace("+00:00", "Z")
                     calendar_fetch_params = {
                         "calendarId": "primary", "timeMin": time_min_str,
-                        "timeMax": time_max_str, "maxResults": 10,
-                        "singleEvents": True, "orderBy": "startTime"
+                        "timeMax": time_max_str, "max_results": 10,
+                        "singleEvents": True, "order_by": "startTime"
                     }
                     # print(f"Attempting GOOGLECALENDAR_FIND_EVENT with params: {calendar_fetch_params}")
                     event_result = await calendar_manager.ensure_auth_and_call_tool("GOOGLECALENDAR_FIND_EVENT", calendar_fetch_params)
@@ -258,13 +258,12 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
     if auth_action_required_overall: # If any service triggered auth, exit now
         return False, important_emails_llm_data, raw_calendar_events
 
-
     # --- Process Calendar with LLM ---
     processed_events_llm_data = []
     if raw_calendar_events and user_config.get(config_manager.NOTIFICATION_PREFS_KEY, {}).get("calendar", "off") != "off":
         # user_interface.print_header(f"Processing {len(raw_calendar_events)} Calendar events with LLM")
         processed_events_llm_data = await llm_processor.process_calendar_events_with_llm(
-            gemini_llm_model, raw_calendar_events, user_persona, user_priorities
+            gemini_llm_model, raw_calendar_events, user_persona, user_priorities, user_config
         )
         # print(f"LLM processed {len(processed_events_llm_data)} calendar event(s).")
 
@@ -329,7 +328,7 @@ async def handle_draft_email_reply(
         draft_subject = current_draft_info.get("subject") # Still useful for context and save_draft
 
         # Use the new confirmation function
-        confirmation_choice = user_interface.get_send_edit_save_cancel_confirmation(
+        confirmation_choice = user_interface.get_send_edit_cancel_confirmation(
             f"Subject: {draft_subject}\n\n{draft_body}",
             service_name="Email Reply"
         )
@@ -368,33 +367,6 @@ async def handle_draft_email_reply(
                 #     print(f"{user_interface.Fore.YELLOW}Gmail authentication might be required again.{user_interface.Style.RESET_ALL}")
                 return False
 
-        elif confirmation_choice == "save_draft":
-            print(f"{user_interface.Style.DIM}Preparing to save draft in Gmail...{user_interface.Style.RESET_ALL}")
-            recipient_for_draft = current_draft_info.get("recipient_email_for_reply") # Original sender
-            original_thread_id_for_draft = current_draft_info.get("original_thread_id")
-
-            if not recipient_for_draft or not draft_subject or not draft_body:
-                 print(f"{user_interface.Fore.RED}Critical draft information missing. Cannot save.{user_interface.Style.RESET_ALL}")
-                 return False
-            if not gmail_mcp_manager or not gmail_mcp_manager.session:
-                print(f"{user_interface.Fore.RED}Gmail MCP session not available. Cannot save draft.{user_interface.Style.RESET_ALL}")
-                return False
-
-            create_draft_outcome = await gmail_mcp_manager.create_gmail_draft(
-                recipient_email=recipient_for_draft,
-                subject=draft_subject, # Use the LLM generated subject
-                body=draft_body,
-                thread_id=original_thread_id_for_draft # So it's a reply draft
-            )
-            if create_draft_outcome.get("successful"):
-                print(f"{user_interface.Fore.GREEN}Success! {create_draft_outcome.get('message', 'Draft saved.')}{user_interface.Style.RESET_ALL}")
-                print(f"{user_interface.Fore.YELLOW}Please review the draft in your Gmail account.{user_interface.Style.RESET_ALL}")
-                return True
-            else:
-                error_msg = create_draft_outcome.get('error', 'Failed to save draft via MCP.')
-                print(f"{user_interface.Fore.RED}MCP Error: {error_msg}{user_interface.Style.RESET_ALL}")
-                return False
-
         elif confirmation_choice == "edit":
             user_edit_instructions = user_interface.get_user_input(f"{user_interface.Fore.CYAN}Your edit instructions (or type your full new draft):{user_interface.Style.RESET_ALL}")
             print(f"{user_interface.Style.DIM}Re-drafting with your instructions...{user_interface.Style.RESET_ALL}")
@@ -419,6 +391,46 @@ async def handle_draft_email_reply(
 # ... (rest of assistant.py, especially main_assistant_entry, remains the same for now) ...
 # The logic in main_assistant_entry that calls handle_draft_email_reply is fine.
 
+async def handle_delete_calendar_event(
+    chosen_event_data: Dict[str, Any],
+    user_config: Dict[str, Any],
+    calendar_mcp_manager: McpSessionManager # Pass the manager
+):
+    original_event_details = chosen_event_data.get("original_event_data", {})
+    event_id_to_delete = original_event_details.get("id")
+    event_title = original_event_details.get("summary", "Unknown Event")
+    # calendar_id = original_event_details.get("calendarId", "primary") # From sample, calendarId isn't directly on event object
+
+    if not event_id_to_delete:
+        print(f"{user_interface.Fore.RED}Error: Could not find Event ID for '{event_title}'. Cannot delete.{user_interface.Style.RESET_ALL}")
+        return False
+
+    confirm_delete = user_interface.get_confirmation(
+        f"Are you sure you want to delete the event: '{event_title}' (ID: {event_id_to_delete})?",
+        destructive=True
+    )
+
+    if confirm_delete:
+        print(f"{user_interface.Style.DIM}Attempting to delete calendar event '{event_title}'...{user_interface.Style.RESET_ALL}")
+        if not calendar_mcp_manager or not calendar_mcp_manager.session:
+            print(f"{user_interface.Fore.RED}Calendar MCP session not available. Cannot delete event.{user_interface.Style.RESET_ALL}")
+            return False
+
+        delete_outcome = await calendar_mcp_manager.delete_calendar_event(event_id=event_id_to_delete) # Defaults to primary calendar
+
+        if delete_outcome.get("successful"):
+            print(f"{user_interface.Fore.GREEN}Success! {delete_outcome.get('message', f'Event {event_title} deleted.')}{user_interface.Style.RESET_ALL}")
+            # PM: Consider re-fetching calendar events here to update the UI immediately, or mark as deleted locally.
+            # For now, the next cycle of perform_proactive_checks will show the updated calendar.
+            return True
+        else:
+            error_msg = delete_outcome.get('error', 'Failed to delete event via MCP.')
+            print(f"{user_interface.Fore.RED}MCP Error: {error_msg}{user_interface.Style.RESET_ALL}")
+            # if delete_outcome.get("needs_user_action"): (handled by ensure_auth_and_call_tool)
+            return False
+    else:
+        print(f"{user_interface.Fore.YELLOW}Event deletion cancelled by user.{user_interface.Style.RESET_ALL}")
+        return True # User cancelled, not a failure of the action itself
 
 
 async def main_assistant_entry():
@@ -517,14 +529,40 @@ async def main_assistant_entry():
         elif action_type == "event":
             chosen_event_data = events_to_display[item_idx]
             chosen_llm_action_text = chosen_event_data['suggested_actions'][action_idx_in_llm_suggestions]
-            print(f"\n{user_interface.Style.BRIGHT}You chose to act on Event:{user_interface.Style.RESET_ALL}")
-            user_interface.display_calendar_event_summary(len(emails_to_display) + item_idx + 1, chosen_event_data)
+
+            user_interface.print_header(f"Action on Event: {chosen_event_data['original_event_data'].get('summary', 'N/A')[:30]}...")
             print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
-            # TODO: Implement Phase 6 - actual action dispatching logic here
-            print(f"{user_interface.Fore.MAGENTA}Action execution for '{chosen_llm_action_text}' on event (ID: {chosen_event_data['original_event_data'].get('id')}) is not yet implemented.{user_interface.Style.RESET_ALL}")
-    else:
-        if emails_to_display or events_to_display: # Only print if there were items but no valid action chosen
-             print(f"{user_interface.Fore.YELLOW}No valid action selected or input was empty.{user_interface.Style.RESET_ALL}")
+
+            # --- New Dispatch Logic for Calendar Actions ---
+            action_handled_successfully = False
+            if "delete" in chosen_llm_action_text.lower() or "cancel event" in chosen_llm_action_text.lower():
+                calendar_mcp_url = user_configuration.get(config_manager.CALENDAR_MCP_URL_KEY)
+                user_id = user_configuration.get(config_manager.USER_EMAIL_KEY)
+                if calendar_mcp_url and user_id:
+                    print(f"{user_interface.Style.DIM}Establishing Calendar session for delete action...{user_interface.Style.RESET_ALL}")
+                    async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action") as action_calendar_manager:
+                        if action_calendar_manager.session:
+                            action_handled_successfully = await handle_delete_calendar_event(
+                                chosen_event_data,
+                                user_configuration,
+                                action_calendar_manager
+                            )
+                        else:
+                            print(f"{user_interface.Fore.RED}Could not establish Calendar session for delete action.{user_interface.Style.RESET_ALL}")
+                else:
+                    print(f"{user_interface.Fore.RED}Calendar config missing. Cannot delete event.{user_interface.Style.RESET_ALL}")
+
+            # elif "create event" in chosen_llm_action_text.lower() or "add to calendar" in chosen_llm_action_text.lower():
+                # await handle_create_calendar_event(...) # TODO Next
+                # action_handled_successfully = True
+
+            else:
+                print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for event (ID: {chosen_event_data['original_event_data'].get('id')}) is not yet specifically implemented.{user_interface.Style.RESET_ALL}")
+
+            if action_handled_successfully:
+                 print(f"{user_interface.Fore.GREEN}Calendar action processed.{user_interface.Style.RESET_ALL}")
+            else:
+                 print(f"{user_interface.Fore.YELLOW}Calendar action was not completed or not applicable.{user_interface.Style.RESET_ALL}")
 
 
     print(f"\n{user_interface.Style.DIM}Assistant interaction finished for this cycle.{user_interface.Style.RESET_ALL}")

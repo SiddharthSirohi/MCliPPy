@@ -248,55 +248,70 @@ class McpSessionManager:
 
         return {"successful": False, "error": f"Unexpected or empty response from {tool_name}."}
 
-    async def create_gmail_draft(self, recipient_email: str, subject: str, body: str, thread_id: Optional[str] = None) -> Dict[str, Any]:
+    async def delete_calendar_event(self, event_id: str, calendar_id: str = "primary") -> Dict[str, Any]:
         """
-        Uses Composio's GMAIL_CREATE_DRAFT tool.
-        Returns a dictionary with success/error and potentially draft_id.
+        Uses Composio's GOOGLECALENDAR_DELETE_EVENT tool.
+        Returns a dictionary with success/error.
         """
-        # ... (this function remains largely the same as before, but it's now a distinct action) ...
         if not self.session:
-            return {"error": "No active Gmail MCP session.", "successful": False}
+            return {"error": "No active Calendar MCP session.", "successful": False}
 
-        tool_name = "GMAIL_CREATE_DRAFT" # This slug is confirmed
+        tool_name = "GOOGLECALENDAR_DELETE_EVENT" # Confirm this slug from your allowed_tools
+
         if tool_name not in self.tools:
-            return {"error": f"Tool '{tool_name}' not available in cached tools for Gmail.", "successful": False}
+            print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Tool '{tool_name}' not available in cached tools.{user_interface.Style.RESET_ALL}")
+            return {"error": f"Tool '{tool_name}' not available.", "successful": False}
 
         params = {
-            "recipient_email": recipient_email,
-            "subject": subject,
-            "body": body,
-            "is_html": False
+            "event_id": event_id,
+            "calendar_id": calendar_id # Composio schema showed this, defaults to primary if not sent
         }
-        if thread_id:
-            params["thread_id"] = thread_id
 
-        print(f"MCP_SM (gmail): Attempting to call tool '{tool_name}' (Save as Draft) with params: Subject='{subject}', Recipient='{recipient_email}', ThreadID='{thread_id}'")
+        print(f"MCP_SM ({self.app_name}): Attempting to call tool '{tool_name}' with EventID='{event_id}', CalendarID='{calendar_id}'")
 
-        draft_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, params)
+        delete_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, params)
 
-        if isinstance(draft_result_from_mcp, dict) and draft_result_from_mcp.get("needs_user_action"):
-            return draft_result_from_mcp
-        if isinstance(draft_result_from_mcp, dict) and draft_result_from_mcp.get("error"):
+        if isinstance(delete_result_from_mcp, dict) and delete_result_from_mcp.get("needs_user_action"):
+            return delete_result_from_mcp # Propagate auth requirement
+        if isinstance(delete_result_from_mcp, dict) and delete_result_from_mcp.get("error"):
             return {
-                "error": draft_result_from_mcp.get("error", f"Unknown error calling {tool_name}"),
+                "error": delete_result_from_mcp.get("error", f"Unknown error calling {tool_name}"),
                 "successful": False,
-                "needs_user_action": draft_result_from_mcp.get("needs_user_action", False)
+                "needs_user_action": delete_result_from_mcp.get("needs_user_action", False)
             }
 
-        if draft_result_from_mcp and hasattr(draft_result_from_mcp, 'content') and draft_result_from_mcp.content:
-            text_content = getattr(draft_result_from_mcp.content[0], 'text', None)
+        # Google Calendar API delete operation usually returns an empty response (204 No Content) on success.
+        # We need to see how Composio's tool wraps this.
+        # Let's assume Composio's JSON wrapper will have a "successful: true" field.
+        if delete_result_from_mcp and hasattr(delete_result_from_mcp, 'content') and delete_result_from_mcp.content:
+            text_content = getattr(delete_result_from_mcp.content[0], 'text', None)
             if text_content:
                 try:
                     composio_response = json.loads(text_content)
                     if composio_response.get("successful"):
-                        draft_id = composio_response.get("data", {}).get("response_data", {}).get("id")
-                        print(f"{user_interface.Fore.GREEN}Successfully created Gmail draft (ID: {draft_id}).{user_interface.Style.RESET_ALL}")
-                        return {"successful": True, "draft_id": draft_id, "message": f"Draft created successfully (ID: {draft_id})."}
+                        print(f"{user_interface.Fore.GREEN}Successfully deleted Calendar event (ID: {event_id}).{user_interface.Style.RESET_ALL}")
+                        return {"successful": True, "message": f"Event ID: {event_id} deleted."}
                     else:
-                        error_msg = composio_response.get("error", f"Failed to create draft, Composio tool reported not successful.")
+                        error_msg = composio_response.get("error", f"Failed to delete event, Composio tool reported not successful.")
                         print(f"{user_interface.Fore.RED}{error_msg}{user_interface.Style.RESET_ALL}")
                         return {"successful": False, "error": error_msg}
                 except json.JSONDecodeError:
-                    return {"successful": False, "error": "Could not parse GMAIL_CREATE_DRAFT response from Composio."}
+                    # Sometimes a successful delete might not return JSON body from the tool,
+                    # or Composio might wrap a 204 differently.
+                    # If no JSON, but no prior error, we might infer success.
+                    # However, it's safer to expect Composio's wrapper.
+                    print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Could not parse {tool_name} response from Composio, but no explicit error from tool call. Raw text: '{text_content[:100]}...'{user_interface.Style.RESET_ALL}")
+                    # Let's assume for now an unparseable response without an MCP error is a problem.
+                    return {"successful": False, "error": f"Could not parse {tool_name} response."}
+        elif delete_result_from_mcp and not hasattr(delete_result_from_mcp, 'isError'):
+            # It might be a ToolCallResult with no content and no isError (for 204)
+            # The Composio tool might just return successful:true even with no other data.
+            # This part is a bit speculative without seeing Composio's exact wrapper for a 204.
+            # The ensure_auth_and_call_tool should ideally return a dict with "successful":True if composio does.
+            # Let's assume if we reach here and it's not an error dict from ensure_auth_and_call_tool, it might have worked.
+            # This logic relies on ensure_auth_and_call_tool correctly parsing Composio's success envelope.
+             print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {tool_name} call returned no content, assuming success if no prior error.{user_interface.Style.RESET_ALL}")
+             return {"successful": True, "message": f"Event ID: {event_id} likely deleted (no content in response)."}
 
-        return {"successful": False, "error": f"Unexpected or empty response from {tool_name}."}
+
+        return {"successful": False, "error": f"Unexpected or empty response from {tool_name} after checking content."}

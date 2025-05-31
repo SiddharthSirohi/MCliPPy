@@ -2,6 +2,8 @@
 import sys
 from typing import List, Dict, Any, Optional, Tuple
 from colorama import Fore, Style, init as colorama_init
+from datetime import datetime, timezone # Ensure datetime is imported
+
 
 # PM Consideration: Initialize colorama once for cross-platform color support.
 colorama_init(autoreset=True)
@@ -47,6 +49,25 @@ def print_header(text: str):
     """Prints a styled header."""
     print(f"\n{Style.BRIGHT}{Fore.MAGENTA}--- {text} ---{Style.RESET_ALL}")
 
+def get_confirmation(prompt_message: str, destructive: bool = False) -> bool:
+    """
+    Gets a yes/no confirmation from the user.
+    If destructive is True, the prompt will be styled more strongly.
+    """
+    style_prefix = f"{Style.BRIGHT}{Fore.RED}" if destructive else f"{Fore.YELLOW}"
+    prompt = f"{style_prefix}{prompt_message}{Style.RESET_ALL} ({Fore.GREEN}y{Style.RESET_ALL}/{Fore.RED}N{Style.RESET_ALL})? : "
+
+    while True:
+        response = input(prompt).strip().lower()
+        if not response: # Default to No for destructive, Yes otherwise (though prompt implies N)
+            return False # Safer to default to No for destructive actions if user just hits enter
+        if response in ['y', 'yes']:
+            return True
+        if response in ['n', 'no']:
+            return False
+        print(f"{Fore.RED}Invalid input. Please enter 'y' or 'n'.{Style.RESET_ALL}")
+
+
 def display_email_summary(index: int, email_data: Dict[str, Any]):
     """Displays a summary for a single important email."""
     original_email = email_data.get("original_email_data", {})
@@ -65,14 +86,39 @@ def display_email_summary(index: int, email_data: Dict[str, Any]):
             print(f"     {Style.BRIGHT}{Fore.GREEN}({chr(97 + i)}){Style.RESET_ALL} {action_text}") # a, b, c...
     print("-" * 10)
 
+def format_datetime_for_display(iso_datetime_str: Optional[str]) -> str:
+    if not iso_datetime_str:
+        return "N/A"
+    try:
+        # Parse the ISO string with timezone
+        dt_object = datetime.fromisoformat(iso_datetime_str)
+        # Convert to local timezone (IST in your case, but let's make it system's local)
+        # Forcing IST:
+        # import pytz
+        # ist = pytz.timezone('Asia/Kolkata')
+        # dt_object_local = dt_object.astimezone(ist)
+        # For system local (simpler if assistant runs on user's machine in their TZ):
+        dt_object_local = dt_object.astimezone() # Converts to system's local timezone
+
+        # Format to AM/PM
+        # Example: "May 31, 07:30 PM" or "Jun 01, 08:00 AM"
+        return dt_object_local.strftime("%b %d, %I:%M %p %Z") # e.g., May 31, 07:30 PM IST
+    except ValueError:
+        return iso_datetime_str # Return original if parsing fails
+
 def display_calendar_event_summary(index: int, event_data: Dict[str, Any]):
-    """Displays a summary for a single calendar event."""
     original_event = event_data.get("original_event_data", {})
     title = original_event.get("summary", "No Title")
-    start_time = original_event.get("start", {}).get("dateTime", "N/A")
+
+    start_iso = original_event.get("start", {}).get("dateTime")
+    end_iso = original_event.get("end", {}).get("dateTime") # Also format end time if needed
+
+    formatted_start_time = format_datetime_for_display(start_iso)
+    # formatted_end_time = format_datetime_for_display(end_iso) # If you want to show end time
 
     print(f"{Style.BRIGHT}{index}. Event: {Fore.YELLOW}{title}{Style.RESET_ALL}")
-    print(f"   Starts: {Fore.YELLOW}{start_time}{Style.RESET_ALL}") # PM: Format this datetime better later
+    print(f"   Starts: {Fore.YELLOW}{formatted_start_time}{Style.RESET_ALL}")
+    # print(f"   Ends:   {Fore.YELLOW}{formatted_end_time}{Style.RESET_ALL}")
     print(f"   {Fore.WHITE}LLM Note: {event_data.get('summary_llm', 'N/A')}{Style.RESET_ALL}")
 
     actions = event_data.get('suggested_actions', [])
@@ -179,38 +225,12 @@ def get_send_edit_cancel_confirmation(draft_text: str, service_name: str = "emai
             f"({Style.BRIGHT}{Fore.RED}C{Style.RESET_ALL}{Fore.CYAN})ancel? {Style.RESET_ALL}"
         ).strip().lower()
         if choice in ['s', 'send']:
-            return "send"
+            return "send_reply"
         if choice in ['e', 'edit']:
             return "edit"
         if choice in ['c', 'cancel', '']: # Empty input defaults to cancel
             return "cancel"
         print(f"{Fore.RED}Invalid choice. Please enter S, E, or C.{Style.RESET_ALL}")
-
-def get_send_edit_save_cancel_confirmation(draft_text: str, service_name: str = "email") -> str:
-    """
-    Displays a draft and asks for confirmation: Send, Edit, Save as Draft, or Cancel.
-    Returns "send", "edit", "save_draft", or "cancel".
-    """
-    print_header(f"Draft {service_name.capitalize()}")
-    print(f"{Fore.WHITE}{draft_text}{Style.RESET_ALL}")
-
-    while True:
-        choice = input(
-            f"{Fore.CYAN}Action: ({Style.BRIGHT}{Fore.GREEN}S{Style.RESET_ALL}{Fore.CYAN})end Reply, "
-            f"({Style.BRIGHT}{Fore.YELLOW}E{Style.RESET_ALL}{Fore.CYAN})dit, "
-            f"Save as (D)raft, " # New option
-            f"({Style.BRIGHT}{Fore.RED}C{Style.RESET_ALL}{Fore.CYAN})ancel? {Style.RESET_ALL}"
-        ).strip().lower()
-        if choice in ['s', 'send']:
-            return "send_reply" # Be specific
-        if choice in ['e', 'edit']:
-            return "edit"
-        if choice in ['d', 'draft', 'save draft']: # New
-            return "save_draft"
-        if choice in ['c', 'cancel', '']:
-            return "cancel"
-        print(f"{Fore.RED}Invalid choice. Please enter S, E, D, or C.{Style.RESET_ALL}")
-
 
 if __name__ == "__main__":
     print("--- Testing user_interface.py ---")
@@ -241,7 +261,7 @@ if __name__ == "__main__":
 
     print("\nTesting draft confirmation:")
     draft = "Hello,\n\nThis is a sample draft email.\n\nBest,\nAssistant"
-    confirmation = confirmation = get_send_edit_save_cancel_confirmation(draft)
+    confirmation = confirmation = get_send_edit_cancel_confirmation(draft)
     print(f"User confirmation for draft: {confirmation}")
 
     print("\n--- Test complete ---")
