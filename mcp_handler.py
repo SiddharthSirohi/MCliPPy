@@ -380,51 +380,56 @@ class McpSessionManager:
            # Add more checks as needed
 
         print(f"MCP_SM ({self.app_name}): Attempting to call '{tool_name}' for EventID='{event_id}' with updates: {updates_for_logging}")
+        tool_call_outcome = await self.ensure_auth_and_call_tool(tool_name, actual_params_to_send)
 
-        update_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, actual_params_to_send)
+        # --- NEW SIMPLIFIED PARSING ---
+        print(f"MCP_SM ({self.app_name}): Raw tool_call_outcome for {tool_name}:") # Keep this debug
+        if isinstance(tool_call_outcome, dict):
+            print(json.dumps(tool_call_outcome, indent=2))
+        elif tool_call_outcome and hasattr(tool_call_outcome, 'content'):
+            print(f"  ToolCallResult.content: {tool_call_outcome.content}")
+            if tool_call_outcome.content and hasattr(tool_call_outcome.content[0], 'text'):
+                print(f"  First content item text: {getattr(tool_call_outcome.content[0], 'text', None)}")
+       # --- END DEBUGGING BLOCK ---
 
-        # --- START DEBUGGING BLOCK ---
-        print(f"MCP_SM ({self.app_name}): Raw update_result_from_mcp for {tool_name}:")
-        if isinstance(update_result_from_mcp, dict): # If it's already an error dict from ensure_auth_and_call_tool
-            print(json.dumps(update_result_from_mcp, indent=2))
-        elif update_result_from_mcp and hasattr(update_result_from_mcp, 'content'):
-            print(f"  ToolCallResult.content: {update_result_from_mcp.content}")
-            if update_result_from_mcp.content:
-                first_item_text = getattr(update_result_from_mcp.content[0], 'text', None)
-                print(f"  First content item text: {first_item_text}")
-        elif update_result_from_mcp:
-            print(f"  ToolCallResult (other structure): {update_result_from_mcp}")
-        else:
-            print(f"  ToolCallResult was None or empty.")
-        # --- END DEBUGGING BLOCK ---
+        # 1. Handle direct error dicts from ensure_auth_and_call_tool
+        if isinstance(tool_call_outcome, dict) and tool_call_outcome.get("error"):
+            print(f"DEBUG_MCP_HANDLER: Returning error directly from ensure_auth_and_call_tool: {tool_call_outcome.get('error')}")
+            return tool_call_outcome # This already has "successful": False (implicitly or explicitly) if it's an error
 
-            # Standard parsing of Composio's response wrapper
-            if isinstance(update_result_from_mcp, dict) and update_result_from_mcp.get("needs_user_action"):
-                return update_result_from_mcp
-            if isinstance(update_result_from_mcp, dict) and update_result_from_mcp.get("error"): # Error from ensure_auth_and_call_tool or Composio
-                return {"error": update_result_from_mcp.get("error", f"Unknown error calling {tool_name}"), "successful": False, "needs_user_action": update_result_from_mcp.get("needs_user_action", False)}
+        # 2. Process ToolCallResult if it's not an error dict
+        if tool_call_outcome and hasattr(tool_call_outcome, 'content') and tool_call_outcome.content:
+            text_content = getattr(tool_call_outcome.content[0], 'text', None)
+            if text_content:
+                try:
+                    composio_response = json.loads(text_content)
+                    print(f"DEBUG_MCP_HANDLER: Parsed composio_response: {json.dumps(composio_response, indent=2)}")
 
-            if update_result_from_mcp and hasattr(update_result_from_mcp, 'content') and update_result_from_mcp.content:
-                text_content = getattr(update_result_from_mcp.content[0], 'text', None)
-                if text_content:
-                    try:
-                        composio_response = json.loads(text_content)
-                        print(f"DEBUG: Parsed composio_response: {json.dumps(composio_response, indent=2)}") # <-- ADD THIS
-                        print(f"DEBUG: Type of composio_response.get('successful'): {type(composio_response.get('successful'))}, Value: {composio_response.get('successful')}") # <-- ADD THIS
+                    if composio_response.get("successful") is True:
+                        print(f"DEBUG_MCP_HANDLER: Composio reported success.")
+                        response_data = composio_response.get("data", {}).get("response_data", {}) # For update/fetch
+                        if not response_data and tool_name == "GOOGLECALENDAR_DELETE_EVENT": # Delete might have empty response_data
+                            response_data = {"message": "Delete operation reported successful by Composio."}
 
-                        if composio_response.get("successful"):
-                            updated_event_data = composio_response.get("data", {}).get("response_data", {})
-                            print(f"{user_interface.Fore.GREEN}Successfully updated Calendar event (ID: {event_id}).{user_interface.Style.RESET_ALL}")
-                            return {"successful": True, "message": f"Event ID: {event_id} updated.", "updated_event_data": updated_event_data}
-                        else:
-                            error_msg = composio_response.get("error", f"Failed to update event, Composio tool reported not successful.")
-                            print(f"{user_interface.Fore.RED}{error_msg}{user_interface.Style.RESET_ALL}")
-                            return {"successful": False, "error": error_msg}
-                    except json.JSONDecodeError:
-                        return {"successful": False, "error": f"Could not parse {tool_name} response."}
+                        print(f"{user_interface.Fore.GREEN}Successfully executed {tool_name} for event (ID: {event_id}).{user_interface.Style.RESET_ALL}")
+                        return {"successful": True, "message": f"Tool {tool_name} successful for event ID: {event_id}.", "response_data": response_data}
 
-        # If ensure_auth_and_call_tool returned a ToolCallResult but it had no content,
-        # and was not an error dict, it implies the MCP call itself was okay but Composio didn't give data.
-        # For an update, we expect some confirmation or the updated event.
-            print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Unexpected or empty content from {tool_name} after tool call.{user_interface.Style.RESET_ALL}")
-            return {"successful": False, "error": f"Unexpected or empty response from {tool_name}."}
+                    elif composio_response.get("successful") is False and composio_response.get("error") is not None:
+                        error_msg = str(composio_response.get("error"))
+                        print(f"{user_interface.Fore.RED}Composio tool '{tool_name}' reported failure: {error_msg}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": error_msg, "composio_reported_error": True}
+
+                    else: # "successful" key not True, or missing, or False without an "error" field
+                        print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Composio response for {tool_name} unclear: {json.dumps(composio_response, indent=2)}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": f"Composio response for {tool_name} did not indicate clear success or provide a specific error."}
+
+                except json.JSONDecodeError:
+                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): JSONDecodeError parsing {tool_name} response: {text_content[:200]}...{user_interface.Style.RESET_ALL}")
+                    return {"successful": False, "error": f"Could not parse {tool_name} JSON response."}
+            else: # text_content is None or empty
+                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): No text_content in {tool_name} response item.{user_interface.Style.RESET_ALL}")
+                return {"successful": False, "error": f"No text content in {tool_name} response item."}
+
+        # 3. Fallback: If tool_call_outcome is not an error dict and not a ToolCallResult with parseable content
+        print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Unhandled result structure from {tool_name}. Raw: {tool_call_outcome}{user_interface.Style.RESET_ALL}")
+        return {"successful": False, "error": f"Unexpected result structure from {tool_name} after tool call."}
