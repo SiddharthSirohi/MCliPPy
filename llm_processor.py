@@ -238,11 +238,12 @@ async def draft_email_reply_with_llm(
         return {"error": "Original email data not provided."}
 
     original_subject = "No Subject"
-    original_sender_email_only = None # Initialize to None
-    original_sender_full_header = "Unknown Sender"
+    original_sender_email_only = None # Will store just the email address
+    original_sender_full_header = "Unknown Sender" # For LLM context
     original_snippet = original_email_data.get("snippet", "")
     original_thread_id = original_email_data.get("threadId", "N/A")
 
+    # Attempt 1: Parse from "payload" headers
     payload = original_email_data.get("payload")
     if payload and isinstance(payload.get("headers"), list):
         for header in payload["headers"]:
@@ -252,40 +253,88 @@ async def draft_email_reply_with_llm(
                 if "<" in original_sender_full_header and ">" in original_sender_full_header:
                     start_index = original_sender_full_header.find("<") + 1
                     end_index = original_sender_full_header.find(">")
-                    if start_index < end_index: # Basic validation
-                        original_sender_email_only = original_sender_full_header[start_index:end_index]
-                elif "@" in original_sender_full_header and "." in original_sender_full_header: # Basic check if it's just an email
-                    original_sender_email_only = original_sender_full_header.strip()
-                # If not a clear email, original_sender_email_only remains None
-                break # Assuming only one 'From' header
-        # We need to ensure original_subject is also reliably fetched
-        for header in payload["headers"]: # Second pass for subject, in case 'From' was first
-            if header.get("name", "").lower() == "subject":
-                original_subject = header.get("value", "No Subject")
-                break
+                    if start_index < end_index:
+                        original_sender_email_only = original_sender_full_header[start_index:end_index].strip()
+                elif "@" in original_sender_full_header: # Basic check if it's just an email
+                    # Check if it's "DisplayName email@domain.com" without <>
+                    parts = original_sender_full_header.split()
+                    if len(parts) > 1 and "@" in parts[-1]: # Last part might be email
+                        potential_email = parts[-1]
+                        if "@" in potential_email and "." in potential_email:
+                            original_sender_email_only = potential_email.strip()
+                        else: # Fallback to the whole string if parsing is tricky
+                            original_sender_email_only = original_sender_full_header.strip()
+                    elif "@" in original_sender_full_header and "." in original_sender_full_header : # It is just an email
+                        original_sender_email_only = original_sender_full_header.strip()
 
-    if not original_sender_email_only: # If parsing failed to find a valid email
-        print(f"LLM_PROCESSOR (Draft Reply): Could not parse a valid sender email from 'From' header: '{original_sender_full_header}'. Cannot determine recipient for reply.")
-        # Fallback: maybe try to get it from Composio's top-level `sender` if that's more reliable?
-        # For now, let's error out if we can't determine the recipient for a reply.
-        # However, your `GMAIL_FETCH_EMAILS` also returns a top-level `sender`. We should use that.
+            elif header_name_lower == "subject":
+                original_subject = header.get("value", "No Subject")
+
+    # Attempt 2: If parsing headers failed, use Composio's top-level `sender` field
+    if not original_sender_email_only:
         composio_top_level_sender = original_email_data.get("sender")
-        if composio_top_level_sender and "@" in composio_top_level_sender:
-             original_sender_email_only = composio_top_level_sender
-             print(f"LLM_PROCESSOR (Draft Reply): Using Composio top-level sender: {original_sender_email_only}")
-        else:
-            return {"error": "Could not determine a valid recipient email for the reply."}
+        if composio_top_level_sender:
+            original_sender_full_header = composio_top_level_sender # Update full header for LLM too
+            if "<" in composio_top_level_sender and ">" in composio_top_level_sender:
+                start_index = composio_top_level_sender.find("<") + 1
+                end_index = composio_top_level_sender.find(">")
+                if start_index < end_index:
+                    original_sender_email_only = composio_top_level_sender[start_index:end_index].strip()
+            elif "@" in composio_top_level_sender and "." in composio_top_level_sender: # Basic check if it's just an email
+                 parts = composio_top_level_sender.split()
+                 if len(parts) > 1 and "@" in parts[-1]:
+                     potential_email = parts[-1]
+                     if "@" in potential_email and "." in potential_email:
+                         original_sender_email_only = potential_email.strip()
+                     else:
+                        original_sender_email_only = composio_top_level_sender.strip() # Fallback
+                 elif "@" in composio_top_level_sender and "." in composio_top_level_sender:
+                     original_sender_email_only = composio_top_level_sender.strip()
+
+
+    if not original_sender_email_only:
+        print(f"LLM_PROCESSOR (Draft Reply): CRITICAL - Could not determine a valid recipient email for the reply from header '{original_sender_full_header}' or top-level '{original_email_data.get('sender')}'.")
+        return {"error": "Could not determine a valid recipient email for the reply."}
+    else:
+        print(f"LLM_PROCESSOR (Draft Reply): Determined recipient for reply as: '{original_sender_email_only}' (from full: '{original_sender_full_header}')")
+
+    original_body_for_llm = original_email_data.get("snippet", "No content available.") # Fallback
+
+    if original_email_data.get("messageText"): # Prioritize messageText
+        original_body_for_llm = original_email_data["messageText"]
+    elif payload and isinstance(payload.get("parts"), list): # Check payload parts for text/plain
+        for part in payload["parts"]:
+            if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+                try:
+                    import base64
+                    decoded_body = base64.urlsafe_b64decode(part["body"]["data"].encode('ASCII')).decode('utf-8')
+                    original_body_for_llm = decoded_body
+                    break # Found plain text part
+                except Exception as e:
+                    print(f"LLM_PROCESSOR (Draft Reply): Error decoding payload part: {e}")
+                    # Stick with snippet if decoding fails
+                    original_body_for_llm = original_email_data.get("snippet", "Error reading body.")
+                    break
+
+    # Limit length for the prompt to avoid overly long prompts
+    max_body_length_for_prompt = 1500
+    if len(original_body_for_llm) > max_body_length_for_prompt:
+        original_body_for_llm_preview = original_body_for_llm[:max_body_length_for_prompt] + "\n[...message truncated...]"
+    else:
+        original_body_for_llm_preview = original_body_for_llm
+    # --- End of body content extraction ---
 
     # Now construct the prompt using the correctly populated variables
     prompt_construction_parts = [
-        f"You are an AI assistant helping a user draft an email reply.",
+        f"You are an AI assistant helping a user draft an email reply. You have access to the user's persona and priorities. However, these are for your general information for steering the direction of the draft. Overall, the draft should be written focused more on the email that it is in response to.",
         f"User's Role: '{user_persona}'",
         f"User's Priorities: '{user_priorities}'",
         "\nOriginal Email Details:",
         f"From: {original_sender_full_header}", # Use full header for LLM context
         f"Subject: {original_subject}",
         f"Thread ID: {original_thread_id}",
-        f"Snippet/Preview: {original_snippet[:300]}",
+        # f"Snippet/Preview: {original_snippet[:300]}", # OLD
+        f"Body Preview of Original Email:\n{original_body_for_llm_preview}", # NEW - use more complete body
         f"\nThe user wants to: \"{action_sentiment}\"."
     ]
 
@@ -322,7 +371,7 @@ async def draft_email_reply_with_llm(
             return {
                 "subject": draft_data["subject"],
                 "body": draft_data["body"],
-                "recipient_email_for_reply": original_sender_email_only, # Ensure this is the parsed email
+                "recipient_email_for_reply": original_sender_email_only, # CRITICAL: Use the parsed email
                 "original_thread_id": original_thread_id,
                 "error": None
             }
