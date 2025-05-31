@@ -224,59 +224,23 @@ Ensure the entire response is a valid JSON array.
 # ... (other imports: genai, json, traceback, asyncio, config_manager) ...
 # ... (process_emails_with_llm and process_calendar_events_with_llm functions remain the same) ...
 
+# llm_processor.py
 async def draft_email_reply_with_llm(
-    # ... (parameters are the same) ...
+    gemini_llm_model,
+    original_email_data: Dict[str, Any],
+    action_sentiment: str,
+    user_persona: str,
+    user_priorities: str,
+    user_edit_instructions: Optional[str] = None
 ) -> Dict[str, str]:
-    # ... (logic to extract original_sender, original_subject, original_thread_id is the same) ...
 
-    prompt = f"""
-You are an AI assistant helping a user draft an email reply.
-User's Role: '{user_persona}'
-User's Priorities: '{user_priorities}'
-
-Original Email Details:
-From: {original_sender}
-Subject: {original_subject} # LLM still needs this for context
-Thread ID: {original_thread_id}
-Snippet/Preview: {original_snippet[:300]}
-
-The user wants to: "{action_sentiment}".
-"""
-    if user_edit_instructions:
-        prompt += f"\nUser's specific instructions for this draft: \"{user_edit_instructions}\"\n"
-
-    prompt += """
-Based on this, please generate:
-1. A "subject" line for context (e.g., "Re: [original subject]"). Even if the reply tool doesn't use it, it's good for display.
-2. A professional and concise email "body" for the reply.
-
-Format your response as a single JSON object with the keys "subject" and "body".
-Example:
-{
-  "subject": "Re: Meeting Request",
-  "body": "Hi [Sender Name],\n\nThanks for reaching out. I'm available on Tuesday afternoon.\n\nBest,\n[User's Name (or generic sign-off)]"
-}
-Ensure the body is plain text. Do not include any other explanatory text outside the JSON object.
-"""
-    # ... (Gemini call and parsing logic remains the same) ...
-    # Ensure the return includes all necessary fields:
-    # if isinstance(draft_data, dict) and "subject" in draft_data and "body" in draft_data:
-    #     return {
-    #         "subject": draft_data["subject"], # For display or if saving as draft
-    #         "body": draft_data["body"],
-    #         "recipient_email_for_reply": original_sender,
-    #         "original_thread_id": original_thread_id,
-    #         "error": None
-    #     }
-    # ...
-    # (The rest of the function is the same)
     if not original_email_data:
         return {"error": "Original email data not provided."}
 
     original_subject = "No Subject"
-    original_sender = "Unknown Sender"
+    original_sender_email_only = None # Initialize to None
+    original_sender_full_header = "Unknown Sender"
     original_snippet = original_email_data.get("snippet", "")
-    # original_message_id = original_email_data.get("messageId", "N/A") # Not strictly needed for reply draft
     original_thread_id = original_email_data.get("threadId", "N/A")
 
     payload = original_email_data.get("payload")
@@ -284,45 +248,69 @@ Ensure the body is plain text. Do not include any other explanatory text outside
         for header in payload["headers"]:
             header_name_lower = header.get("name", "").lower()
             if header_name_lower == "from":
-                # Extract just the email from "Display Name <email@example.com>"
-                val = header.get("value", "Unknown Sender")
-                if "<" in val and ">" in val:
-                    original_sender = val[val.find("<")+1:val.find(">")]
-                else:
-                    original_sender = val # Assume it's just the email
-            elif header_name_lower == "subject":
+                original_sender_full_header = header.get("value", "Unknown Sender")
+                if "<" in original_sender_full_header and ">" in original_sender_full_header:
+                    start_index = original_sender_full_header.find("<") + 1
+                    end_index = original_sender_full_header.find(">")
+                    if start_index < end_index: # Basic validation
+                        original_sender_email_only = original_sender_full_header[start_index:end_index]
+                elif "@" in original_sender_full_header and "." in original_sender_full_header: # Basic check if it's just an email
+                    original_sender_email_only = original_sender_full_header.strip()
+                # If not a clear email, original_sender_email_only remains None
+                break # Assuming only one 'From' header
+        # We need to ensure original_subject is also reliably fetched
+        for header in payload["headers"]: # Second pass for subject, in case 'From' was first
+            if header.get("name", "").lower() == "subject":
                 original_subject = header.get("value", "No Subject")
+                break
 
-    prompt_context = f"""
-Original Email:
-From: {original_sender}
-Subject: {original_subject}
-Thread ID: {original_thread_id}
-Snippet: {original_snippet[:300]}
+    if not original_sender_email_only: # If parsing failed to find a valid email
+        print(f"LLM_PROCESSOR (Draft Reply): Could not parse a valid sender email from 'From' header: '{original_sender_full_header}'. Cannot determine recipient for reply.")
+        # Fallback: maybe try to get it from Composio's top-level `sender` if that's more reliable?
+        # For now, let's error out if we can't determine the recipient for a reply.
+        # However, your `GMAIL_FETCH_EMAILS` also returns a top-level `sender`. We should use that.
+        composio_top_level_sender = original_email_data.get("sender")
+        if composio_top_level_sender and "@" in composio_top_level_sender:
+             original_sender_email_only = composio_top_level_sender
+             print(f"LLM_PROCESSOR (Draft Reply): Using Composio top-level sender: {original_sender_email_only}")
+        else:
+            return {"error": "Could not determine a valid recipient email for the reply."}
 
-User wants to respond with the sentiment/action: "{action_sentiment}".
-"""
+    # Now construct the prompt using the correctly populated variables
+    prompt_construction_parts = [
+        f"You are an AI assistant helping a user draft an email reply.",
+        f"User's Role: '{user_persona}'",
+        f"User's Priorities: '{user_priorities}'",
+        "\nOriginal Email Details:",
+        f"From: {original_sender_full_header}", # Use full header for LLM context
+        f"Subject: {original_subject}",
+        f"Thread ID: {original_thread_id}",
+        f"Snippet/Preview: {original_snippet[:300]}",
+        f"\nThe user wants to: \"{action_sentiment}\"."
+    ]
+
     if user_edit_instructions:
-        prompt_context += f"\nUser's specific edit instructions: \"{user_edit_instructions}\"\n"
+        prompt_construction_parts.append(f"\nUser's specific instructions for this draft: \"{user_edit_instructions}\"")
 
-    full_prompt = f"""
-You are an AI assistant for a user whose role is: '{user_persona}'. Their priorities are: '{user_priorities}'.
-You are helping them draft an email reply.
+    prompt_construction_parts.append(
+        "\nBased on this, please generate:"
+        "\n1. A suitable reply \"subject\" line (usually \"Re: [original subject]\")."
+        "\n2. A professional and concise email \"body\" for the reply."
+        "\n\nFormat your response as a single JSON object with the keys \"subject\" and \"body\"."
+        "\nExample:"
+        "\n{"
+        "\n  \"subject\": \"Re: Meeting Request\","
+        "\n  \"body\": \"Hi [Sender Name],\\n\\nThanks for reaching out. I'm available on Tuesday afternoon.\\n\\nBest,\\n[User's Name (or generic sign-off)]\""
+        "\n}"
+        "\nEnsure the body is plain text. Do not include any other explanatory text outside the JSON object."
+    )
 
-{prompt_context}
+    final_prompt_for_llm = "\n".join(prompt_construction_parts)
 
-Generate a JSON object with "subject" and "body" for the reply.
-The subject should typically be "Re: [original subject]".
-The body should be a professional, concise reply reflecting the user's intent.
-Example JSON:
-{{
-  "subject": "Re: Original Subject",
-  "body": "Dear [Sender Name],\n\n[Your reply text here]\n\nThanks,\n[User's Name (or generic sign-off)]"
-}}
-"""
     response_text_for_debugging = "Gemini call for draft did not occur or failed."
     try:
-        response = await gemini_llm_model.generate_content_async(full_prompt)
+        # print(f"LLM_PROCESSOR (Draft Reply Debug): Final Prompt Sent:\n{final_prompt_for_llm}") # For debugging if needed
+        response = await gemini_llm_model.generate_content_async(final_prompt_for_llm)
         response_text_for_debugging = response.text
 
         cleaned_response_text = response.text.strip()
@@ -334,22 +322,22 @@ Example JSON:
             return {
                 "subject": draft_data["subject"],
                 "body": draft_data["body"],
-                "recipient_email_for_reply": original_sender,
+                "recipient_email_for_reply": original_sender_email_only, # Ensure this is the parsed email
                 "original_thread_id": original_thread_id,
                 "error": None
             }
         else:
+            print(f"LLM_PROCESSOR (Draft Reply): LLM response was not a dict with subject/body: {draft_data}")
             return {"error": "LLM did not return draft in expected subject/body format."}
-    # ... (rest of error handling is the same) ...
     except json.JSONDecodeError:
         print(f"LLM_PROCESSOR (Draft Reply): Failed to decode Gemini JSON response for draft.")
         print(f"LLM_PROCESSOR (Draft Reply): Raw response: {response_text_for_debugging}")
         return {"error": "LLM JSON parsing error for draft."}
     except Exception as e:
         print(f"LLM_PROCESSOR (Draft Reply): Error during Gemini API call for draft: {e}")
-        print(f"LLM_PROCESSOR (Draft Reply): Raw response: {response_text_for_debugging}")
-        traceback.print_exc()
-        return {"error": "LLM API call error for draft."}
+        print(f"LLM_PROCESSOR (Draft Reply): Raw response (if available): {response_text_for_debugging}")
+        # traceback.print_exc() # Uncomment for full traceback if needed
+        return {"error": f"LLM API call error for draft: {str(e)}"}
 
 # --- Test Stub for this module ---
 async def _test_llm_processor():

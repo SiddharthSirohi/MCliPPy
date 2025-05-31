@@ -338,9 +338,15 @@ async def handle_draft_email_reply(
             print(f"{user_interface.Style.DIM}Preparing to send reply via Gmail...{user_interface.Style.RESET_ALL}")
             recipient_for_reply = current_draft_info.get("recipient_email_for_reply")
             original_thread_id = current_draft_info.get("original_thread_id")
+            draft_body = current_draft_info.get("body") # Make sure body is also fetched
 
-            if not recipient_for_reply or not original_thread_id or not draft_body:
-                 print(f"{user_interface.Fore.RED}Critical reply information missing (recipient, thread ID, or body). Cannot send.{user_interface.Style.RESET_ALL}")
+            # CRITICAL CHECK FOR RECIPIENT
+            if not recipient_for_reply or recipient_for_reply == "Unknown Sender" or "@" not in recipient_for_reply:
+                 print(f"{user_interface.Fore.RED}Cannot send reply: Valid recipient email not found. Found: '{recipient_for_reply}'{user_interface.Style.RESET_ALL}")
+                 return False # Critical info missing
+
+            if not original_thread_id or not draft_body:
+                 print(f"{user_interface.Fore.RED}Critical reply information missing (thread ID or body). Cannot send.{user_interface.Style.RESET_ALL}")
                  return False
 
             if not gmail_mcp_manager or not gmail_mcp_manager.session:
@@ -413,6 +419,8 @@ async def handle_draft_email_reply(
 # ... (rest of assistant.py, especially main_assistant_entry, remains the same for now) ...
 # The logic in main_assistant_entry that calls handle_draft_email_reply is fine.
 
+
+
 async def main_assistant_entry():
     """Entry point for the assistant logic."""
     if not config_manager.DEV_CONFIG.get(config_manager.ENV_GOOGLE_API_KEY):
@@ -472,9 +480,39 @@ async def main_assistant_entry():
             print(f"\n{user_interface.Style.BRIGHT}You chose to act on Email:{user_interface.Style.RESET_ALL}")
             user_interface.display_email_summary(item_idx + 1, chosen_email_data) # Display it again for context
             print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
-            # TODO: Implement Phase 6 - actual action dispatching logic here
-            # e.g., if "Draft" in chosen_llm_action_text: await handle_draft_email_reply(...)
-            print(f"{user_interface.Fore.MAGENTA}Action execution for '{chosen_llm_action_text}' on email (ID: {chosen_email_data['original_email_data'].get('messageId')}) is not yet implemented.{user_interface.Style.RESET_ALL}")
+            # --- THIS IS THE NEW INTEGRATION POINT ---
+            if "draft" in chosen_llm_action_text.lower() or \
+               "reply" in chosen_llm_action_text.lower() or \
+               "confirm availability" in chosen_llm_action_text.lower() or \
+               "suggest an alternative time" in chosen_llm_action_text.lower(): # Make matching more robust
+
+                gmail_mcp_url = user_configuration.get(config_manager.GMAIL_MCP_URL_KEY)
+                user_id = user_configuration.get(config_manager.USER_EMAIL_KEY)
+
+                if gmail_mcp_url and user_id:
+                    print(f"{user_interface.Style.DIM}Establishing Gmail session for action...{user_interface.Style.RESET_ALL}")
+                    # Create a new session manager instance specifically for this action.
+                    # This ensures a fresh connection if needed, especially if perform_proactive_checks closed its sessions.
+                    async with McpSessionManager(gmail_mcp_url, user_id, "gmail") as action_gmail_manager:
+                        if action_gmail_manager.session:
+                            action_succeeded = await handle_draft_email_reply(
+                                gemini_llm_model,
+                                chosen_email_data,
+                                chosen_llm_action_text, # This text becomes the 'action_sentiment'
+                                user_configuration,
+                                action_gmail_manager
+                            )
+                            if action_succeeded:
+                                print(f"{user_interface.Fore.GREEN}Email action completed.{user_interface.Style.RESET_ALL}")
+                            else:
+                                print(f"{user_interface.Fore.RED}Email action did not complete successfully.{user_interface.Style.RESET_ALL}")
+                        else:
+                            print(f"{user_interface.Fore.RED}Could not establish Gmail session for the action.{user_interface.Style.RESET_ALL}")
+                else:
+                    print(f"{user_interface.Fore.RED}Gmail configuration (URL or User ID) missing. Cannot perform email action.{user_interface.Style.RESET_ALL}")
+            else:
+                # Fallback for other LLM suggested email actions not yet implemented
+                print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for email (ID: {chosen_email_data['original_email_data'].get('messageId')}) is not yet specifically implemented beyond drafting/replying.{user_interface.Style.RESET_ALL}")
 
         elif action_type == "event":
             chosen_event_data = events_to_display[item_idx]
