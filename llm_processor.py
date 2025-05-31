@@ -419,6 +419,107 @@ async def draft_email_reply_with_llm(
         # traceback.print_exc() # Uncomment for full traceback if needed
         return {"error": f"LLM API call error for draft: {str(e)}"}
 
+async def parse_event_creation_details_from_suggestion(
+    gemini_llm_model,
+    llm_suggestion_text: str, # e.g., "Create event: 'Team Sync' Tuesday 3pm with john@example.com"
+    original_context_text: Optional[str], # e.g., email body or original event summary that prompted this
+    user_persona: str,
+    user_priorities: str,
+    current_datetime_iso: str # Current ISO datetime to help LLM resolve relative times like "tomorrow"
+) -> Dict[str, Any]:
+    """
+    Parses an LLM's textual suggestion or email content to extract structured details
+    for creating a new Google Calendar event.
+    Returns a dictionary like:
+    {
+        "summary": "Team Sync",
+        "start_datetime": "2025-06-03T15:00:00", // Naive
+        "timezone": "Asia/Kolkata",
+        "event_duration_hour": 1,
+        "event_duration_minutes": 0,
+        "attendees": ["john@example.com"], // List of email strings
+        "description": "Generated from suggestion: ...",
+        "location": None,
+        "create_meeting_room": True, // Default to creating a meet link
+        "error": None
+    }
+    or {"error": "message"}
+    """
+    prompt_parts = [
+        f"You are an AI assistant helping a user create a new Google Calendar event.",
+        f"User's Role: '{user_persona}'. User's Priorities: '{user_priorities}'.",
+        f"The current date and time is: {current_datetime_iso}.",
+        f"The user's primary timezone is likely Asia/Kolkata, but confirm if the input specifies another.",
+        f"\nThe user's intention or the text suggesting event creation is: '{llm_suggestion_text}'."
+    ]
+    if original_context_text:
+        prompt_parts.append(f"\nThis suggestion was made in the context of the following text (e.g., an email):"
+                            f"\n\"\"\"\n{original_context_text[:1000]}\n\"\"\"")
+
+    prompt_parts.extend([
+        f"\nBased on this, extract the following details for the new event. If a detail is not mentioned, use a sensible default or leave it null/empty where appropriate:",
+        f"- summary (string, event title, make it concise)",
+        f"- start_datetime (string, REQUIRED, in YYYY-MM-DDTHH:MM:SS naive local time based on context. Resolve 'tomorrow', 'next Tuesday at 3pm' etc., relative to current time)",
+        f"- timezone (string, REQUIRED, IANA timezone like 'Asia/Kolkata' or 'America/New_York' for the start_datetime)",
+        f"- event_duration_hour (integer, default 0 or 1 if it's a meeting)",
+        f"- event_duration_minutes (integer, default 30 or 0 if hour is set)",
+        f"- attendees (array of email strings, optional, extract from context if mentioned)",
+        f"- description (string, optional, can be generated from context)",
+        f"- location (string, optional)",
+        f"- create_meeting_room (boolean, default to true if it seems like a meeting that would need one)",
+        f"\nFormat your response as a single JSON object with these keys.",
+        f"Example JSON output:",
+        f"{{",
+        f"  \"summary\": \"Meeting with Marketing Team\",",
+        f"  \"start_datetime\": \"2025-06-04T14:00:00\",",
+        f"  \"timezone\": \"Asia/Kolkata\",",
+        f"  \"event_duration_hour\": 1,",
+        f"  \"event_duration_minutes\": 0,",
+        f"  \"attendees\": [\"jane@example.com\", \"marketing_lead@example.com\"],",
+        f"  \"description\": \"Discuss Q3 marketing strategy based on email from Jane.\",",
+        f"  \"location\": \"Online / Google Meet\",",
+        f"  \"create_meeting_room\": true",
+        f"}}"
+    ])
+    final_prompt = "\n".join(prompt_parts)
+
+    response_text_for_debugging = "Gemini call for parsing event creation details did not occur or failed."
+    try:
+        # print(f"LLM_PROCESSOR (Parse Create Event DEBUG): Prompt:\n{final_prompt}")
+        response = await gemini_llm_model.generate_content_async(final_prompt)
+        response_text_for_debugging = response.text
+        # print(f"LLM_PROCESSOR (Parse Create Event DEBUG): Raw Response:\n{response_text_for_debugging}")
+
+
+        cleaned_response_text = response.text.strip()
+        if cleaned_response_text.startswith("```json"): cleaned_response_text = cleaned_response_text[7:]
+        if cleaned_response_text.endswith("```"): cleaned_response_text = cleaned_response_text[:-3]
+
+        parsed_details = json.loads(cleaned_response_text)
+
+        # Basic validation of required fields
+        if not all(k in parsed_details for k in ["summary", "start_datetime", "timezone"]):
+            print(f"LLM_PROCESSOR (Parse Create Event): LLM did not return all required fields (summary, start_datetime, timezone). Parsed: {parsed_details}")
+            return {"error": "LLM failed to extract all required event details (summary, start_datetime, timezone)."}
+
+        # Ensure duration defaults if not present
+        parsed_details.setdefault("event_duration_hour", 0)
+        parsed_details.setdefault("event_duration_minutes", 30 if parsed_details["event_duration_hour"] == 0 else 0)
+        parsed_details.setdefault("attendees", [])
+        parsed_details.setdefault("create_meeting_room", True) # Default to true for meetings
+
+        return parsed_details
+
+    except json.JSONDecodeError:
+        print(f"LLM_PROCESSOR (Parse Create Event): Failed to decode Gemini JSON response.")
+        print(f"LLM_PROCESSOR (Parse Create Event): Raw response: {response_text_for_debugging}")
+        return {"error": "LLM JSON parsing error for event creation details."}
+    except Exception as e:
+        print(f"LLM_PROCESSOR (Parse Create Event): Error during Gemini API call: {e}")
+        # traceback.print_exc()
+        return {"error": f"LLM API call error for event creation details: {str(e)}"}
+
+
 # --- Test Stub for this module ---
 async def _test_llm_processor():
     print("--- Testing llm_processor.py ---")

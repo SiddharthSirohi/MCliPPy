@@ -416,6 +416,87 @@ def get_event_update_choices(original_event_summary: str, original_event_details
         else:
             print(f"{Fore.RED}Invalid choice.{Style.RESET_ALL}")
 
+def get_event_creation_confirmation_and_edits(
+    llm_parsed_details: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """
+    Displays LLM-parsed details for a new event and allows user to confirm or edit.
+    Returns the finalized event details dictionary for creation, or None if cancelled.
+    """
+    print_header("Create New Calendar Event")
+
+    current_details = llm_parsed_details.copy() # Work on a copy
+
+    fields_for_creation = {
+        "1": {"name": "Title (Summary)", "key": "summary", "type": "str"},
+        "2": {"name": "Start Datetime (YYYY-MM-DDTHH:MM:SS)", "key": "start_datetime", "type": "datetime_str"},
+        "3": {"name": "Timezone (e.g., Asia/Kolkata)", "key": "timezone", "type": "str"},
+        "4": {"name": "Duration (Hours, Minutes)", "key": "duration", "type": "duration"},
+        "5": {"name": "Description", "key": "description", "type": "str_optional"},
+        "6": {"name": "Location", "key": "location", "type": "str_optional"},
+        "7": {"name": "Attendees (comma-separated emails)", "key": "attendees", "type": "email_list_str"}, # List of strings for CREATE tool
+        "8": {"name": "Add Google Meet Link", "key": "create_meeting_room", "type": "bool_choice"},
+    }
+    # Note: 'str_optional' and 'email_list_str' are for get_user_input prompting, actual type is str/list
+    # 'bool_choice' is for get_yes_no_input
+
+    while True:
+        print("\nPlease review and confirm details for the new event (or edit):")
+        for key_choice, info in fields_for_creation.items():
+            val = current_details.get(info["key"])
+            if info["key"] == "duration": # Special display for duration
+                h = current_details.get("event_duration_hour", 0)
+                m = current_details.get("event_duration_minutes", 30)
+                val_display = f"{h}h {m}m"
+            elif isinstance(val, list):
+                val_display = ", ".join(val) if val else "None"
+            elif isinstance(val, bool):
+                val_display = str(val)
+            else:
+                val_display = val if val is not None else "Not set"
+            print(f"  {Style.BRIGHT}{key_choice}{Style.RESET_ALL}. {info['name']}: {Fore.YELLOW}{val_display}{Style.RESET_ALL}")
+
+        print(f"\n  {Style.BRIGHT}s{Style.RESET_ALL}. Save and Create Event")
+        print(f"  {Style.BRIGHT}c{Style.RESET_ALL}. Cancel Creation")
+
+        choice = get_user_input("Choose field to edit, 's' to save, or 'c' to cancel").lower()
+
+        if choice == 'c': return None
+        if choice == 's':
+            # Validate required fields before returning
+            if not all(k in current_details for k in ["summary", "start_datetime", "timezone"]):
+                print(f"{Fore.RED}Error: Title, Start Datetime, and Timezone are required to create an event.{Style.RESET_ALL}")
+                continue # Go back to edit menu
+            return current_details
+
+        if choice in fields_for_creation:
+            field_info = fields_for_creation[choice]
+            field_key = field_info["key"]
+
+            if field_key == "duration":
+                try:
+                    h = int(get_user_input("Enter duration hours (0-23)", default=str(current_details.get("event_duration_hour",0)) ))
+                    m = int(get_user_input("Enter duration minutes (0-59)", default=str(current_details.get("event_duration_minutes",30)) ))
+                    if 0 <= h <= 23 and 0 <= m <= 59:
+                        current_details["event_duration_hour"] = h
+                        current_details["event_duration_minutes"] = m
+                except ValueError: print(f"{Fore.RED}Invalid duration.{Style.RESET_ALL}")
+            elif field_key == "attendees": # Expects list of strings for CREATE_EVENT
+                emails_str = get_user_input(f"Enter {field_info['name']}", default=", ".join(current_details.get(field_key,[])))
+                current_details[field_key] = [e.strip() for e in emails_str.split(',') if e.strip() and "@" in e]
+            elif field_key == "create_meeting_room":
+                current_details[field_key] = get_yes_no_input(f"{field_info['name']}?", default_yes=current_details.get(field_key, True))
+            elif field_key == "start_datetime":
+                new_val = get_user_input(f"Enter new {field_info['name']} (YYYY-MM-DDTHH:MM:SS)", default=current_details.get(field_key))
+                try:
+                    datetime.strptime(new_val, "%Y-%m-%dT%H:%M:%S")
+                    current_details[field_key] = new_val
+                except ValueError: print(f"{Fore.RED}Invalid datetime format.{Style.RESET_ALL}")
+            else: # For 'summary', 'timezone', 'description', 'location'
+                current_details[field_key] = get_user_input(f"Enter new {field_info['name']}", default=current_details.get(field_key))
+        else:
+            print(f"{Fore.RED}Invalid choice.{Style.RESET_ALL}")
+
 if __name__ == "__main__":
     print("--- Testing user_interface.py ---")
 

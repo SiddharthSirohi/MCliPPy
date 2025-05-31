@@ -474,6 +474,77 @@ async def handle_update_calendar_event(
         print(f"{user_interface.Fore.RED}MCP Error: {error_msg}{user_interface.Style.RESET_ALL}")
         return False
 
+async def handle_create_calendar_event(
+    gemini_llm_model, # The initialized Gemini model instance
+    llm_suggestion_text: str, # e.g., "Create event: 'Team Sync' Tuesday 3pm with john@example.com"
+                              # or "Schedule a 30-min follow-up for Project Alpha"
+    original_context_text: Optional[str], # e.g., email body or original event summary
+    user_config: Dict[str, Any],
+    calendar_mcp_manager: McpSessionManager # The active McpSessionManager for Calendar
+) -> bool: # Returns True if action was processed (even if cancelled by user), False on critical error
+    """
+    Handles the workflow for creating a new calendar event based on an LLM suggestion.
+    """
+    user_persona = user_config.get(config_manager.USER_PERSONA_KEY, "a professional")
+    user_priorities = user_config.get(config_manager.USER_PRIORITIES_KEY, "key tasks")
+
+    # Get current time to help LLM resolve relative dates/times in its parsing
+    # The LLM needs current time in UTC preferably, or with explicit timezone
+    # Google API event times are often handled with specific timezones or UTC.
+    # Let's provide UTC to the LLM for parsing, and then handle timezone in UI/MCP call.
+    current_time_for_llm_context = datetime.now(timezone.utc).isoformat()
+
+
+    print(f"\n{user_interface.Style.DIM}Assistant is parsing details for new event based on: '{llm_suggestion_text}'...{user_interface.Style.RESET_ALL}")
+
+    parsed_event_details_from_llm = await llm_processor.parse_event_creation_details_from_suggestion(
+        gemini_llm_model=gemini_llm_model,
+        llm_suggestion_text=llm_suggestion_text,
+        original_context_text=original_context_text,
+        user_persona=user_persona,
+        user_priorities=user_priorities,
+        current_datetime_iso=current_time_for_llm_context
+    )
+
+    if not parsed_event_details_from_llm or parsed_event_details_from_llm.get("error"):
+        error_msg = parsed_event_details_from_llm.get("error", "Failed to parse event creation details from LLM suggestion.") if parsed_event_details_from_llm else "LLM parsing for event creation returned None."
+        print(f"{user_interface.Fore.RED}Could not create event: {error_msg}{user_interface.Style.RESET_ALL}")
+        return False # Indicate failure to process this action
+
+    # Now, let the user confirm and potentially edit these parsed details
+    final_event_details_for_api = user_interface.get_event_creation_confirmation_and_edits(
+        parsed_event_details_from_llm # Pass the dictionary parsed by the LLM
+    )
+
+    if not final_event_details_for_api: # User cancelled in the UI
+        print(f"{user_interface.Fore.YELLOW}Event creation cancelled by user.{user_interface.Style.RESET_ALL}")
+        return True # Action was "handled" by user cancelling, not a script error
+
+    # Proceed to call the MCP tool to create the event
+    print(f"{user_interface.Style.DIM}Attempting to create calendar event: '{final_event_details_for_api.get('summary', 'Untitled Event')}'...{user_interface.Style.RESET_ALL}")
+
+    if not calendar_mcp_manager or not calendar_mcp_manager.session:
+        print(f"{user_interface.Fore.RED}Calendar MCP session not available. Cannot create event.{user_interface.Style.RESET_ALL}")
+        return False
+
+    create_outcome = await calendar_mcp_manager.create_calendar_event(
+        event_details=final_event_details_for_api
+        # calendar_id defaults to "primary" in create_calendar_event method
+    )
+
+    if create_outcome.get("successful"):
+        created_event_response_data = create_outcome.get("created_event_data", {})
+        event_summary_created = created_event_response_data.get('summary', final_event_details_for_api.get('summary', 'Untitled Event'))
+        event_id_created = created_event_response_data.get('id', 'N/A')
+        print(f"{user_interface.Fore.GREEN}Success! {create_outcome.get('message', 'Event created.')} "
+              f"Title: '{event_summary_created}', ID: {event_id_created}{user_interface.Style.RESET_ALL}")
+        # PM: Consider if assistant should offer to add it to a local "just created" list for the current cycle display
+        return True
+    else:
+        error_msg = create_outcome.get('error', 'Failed to create event via MCP tool.')
+        print(f"{user_interface.Fore.RED}MCP Error creating event: {error_msg}{user_interface.Style.RESET_ALL}")
+        return False
+
 
 async def main_assistant_entry():
     """Entry point for the assistant logic."""
@@ -578,6 +649,30 @@ async def main_assistant_entry():
                                 print(f"{user_interface.Fore.RED}Could not establish Gmail session for the action.{user_interface.Style.RESET_ALL}")
                     else:
                         print(f"{user_interface.Fore.RED}Gmail configuration (URL or User ID) missing.{user_interface.Style.RESET_ALL}")
+
+                elif "create calendar event" in chosen_llm_action_text.lower() or \
+                    "schedule a meeting" in chosen_llm_action_text.lower() or \
+                    "add to calendar" in chosen_llm_action_text.lower(): # Keywords for creating event
+
+                    original_email_body_for_context = chosen_email_data.get("original_email_data", {}).get("messageText") or \
+                                                    chosen_email_data.get("original_email_data", {}).get("snippet","No original email body available for context.")
+
+                    if calendar_mcp_url and user_id: # Ensure we have calendar config
+                        print(f"{user_interface.Style.DIM}Establishing Calendar session for create action (from email)...{user_interface.Style.RESET_ALL}")
+                        async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-create-from-email") as action_calendar_manager:
+                            if action_calendar_manager.session:
+                                action_succeeded_this_turn = await handle_create_calendar_event(
+                                    gemini_llm_model,
+                                    chosen_llm_action_text, # The LLM's suggestion string
+                                    original_email_body_for_context,
+                                    user_configuration,
+                                    action_calendar_manager
+                                )
+                            else:
+                                print(f"{user_interface.Fore.RED}Could not establish Calendar session for create action.{user_interface.Style.RESET_ALL}")
+                    else:
+                        print(f"{user_interface.Fore.RED}Calendar configuration missing. Cannot create event from email.{user_interface.Style.RESET_ALL}")
+
                 else:
                     print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for email is not yet specifically implemented beyond drafting/replying.{user_interface.Style.RESET_ALL}")
 

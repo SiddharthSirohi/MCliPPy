@@ -433,3 +433,79 @@ class McpSessionManager:
         # 3. Fallback: If tool_call_outcome is not an error dict and not a ToolCallResult with parseable content
         print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Unhandled result structure from {tool_name}. Raw: {tool_call_outcome}{user_interface.Style.RESET_ALL}")
         return {"successful": False, "error": f"Unexpected result structure from {tool_name} after tool call."}
+
+    async def create_calendar_event(self, event_details: Dict[str, Any], calendar_id: str = "primary") -> Dict[str, Any]:
+        """
+        Uses Composio's GOOGLECALENDAR_CREATE_EVENT tool.
+        event_details should contain: summary, start_datetime, timezone,
+                                   event_duration_hour, event_duration_minutes,
+                                   and optional: attendees (list of str), description, location, create_meeting_room
+        """
+        if not self.session:
+            return {"error": "No active Calendar MCP session.", "successful": False}
+
+        tool_name = "GOOGLECALENDAR_CREATE_EVENT"
+        if tool_name not in self.tools:
+            print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Tool '{tool_name}' not available.{user_interface.Style.RESET_ALL}")
+            return {"error": f"Tool '{tool_name}' not available.", "successful": False}
+
+        # Prepare params from event_details, ensuring required ones are present
+        params = {"calendar_id": calendar_id}
+
+        required_keys = ["summary", "start_datetime", "timezone"] # As per Composio schema, summary is optional, but practically needed
+        for req_key in required_keys:
+            if req_key not in event_details or not event_details[req_key]:
+                # Summary can be optional by schema, but let's enforce it for better UX
+                if req_key == "summary" and not event_details.get(req_key):
+                    params[req_key] = "Untitled Event" # Default if LLM/user missed it
+                else:
+                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Missing required key '{req_key}' for {tool_name}.{user_interface.Style.RESET_ALL}")
+                    return {"error": f"Missing required key '{req_key}' for event creation.", "successful": False}
+
+        params.update(event_details) # Add all details from the validated dict
+
+        # Ensure duration defaults if not provided by LLM/user and not in event_details from parsing
+        params.setdefault("event_duration_hour", 0)
+        params.setdefault("event_duration_minutes", 30 if params["event_duration_hour"] == 0 else 0)
+
+
+        print(f"MCP_SM ({self.app_name}): Attempting to call '{tool_name}' with params: { {k:v for k,v in params.items() if k != 'calendar_id'} }") # Log without calendar_id for brevity
+
+        creation_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, params)
+
+        # Use the same robust parsing logic as update_calendar_event
+        if isinstance(creation_result_from_mcp, dict) and creation_result_from_mcp.get("error"):
+            return creation_result_from_mcp
+
+        if creation_result_from_mcp and hasattr(creation_result_from_mcp, 'content') and creation_result_from_mcp.content:
+            text_content = getattr(creation_result_from_mcp.content[0], 'text', None)
+            if text_content:
+                try:
+                    composio_response = json.loads(text_content)
+                    print(f"DEBUG_MCP_HANDLER (CreateEvent): Parsed composio_response: {json.dumps(composio_response, indent=2)}")
+
+                    if composio_response.get("successful") is True:
+                        created_event_data = composio_response.get("data", {}).get("response_data", {})
+                        event_id = created_event_data.get("id", "N/A")
+                        print(f"{user_interface.Fore.GREEN}Successfully created Calendar event (ID: {event_id}).{user_interface.Style.RESET_ALL}")
+                        return {"successful": True, "message": f"Event created (ID: {event_id}).", "created_event_data": created_event_data}
+                    elif composio_response.get("successful") is False and composio_response.get("error") is not None:
+                        # ... (error handling as in update_calendar_event) ...
+                        error_msg = str(composio_response.get("error"))
+                        print(f"{user_interface.Fore.RED}Composio tool '{tool_name}' reported failure: {error_msg}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": error_msg, "composio_reported_error": True}
+                    else:
+                        # ... (unclear success handling as in update_calendar_event) ...
+                        print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Composio response for {tool_name} unclear: {json.dumps(composio_response, indent=2)}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": f"Composio response for {tool_name} did not indicate clear success or provide a specific error."}
+                except json.JSONDecodeError:
+                    # ... (JSON decode error handling) ...
+                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): JSONDecodeError parsing {tool_name} response: {text_content[:200]}...{user_interface.Style.RESET_ALL}")
+                    return {"successful": False, "error": f"Could not parse {tool_name} JSON response."}
+            else: # text_content is None or empty
+                # ... (no text_content error handling) ...
+                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): No text_content in {tool_name} response item.{user_interface.Style.RESET_ALL}")
+                return {"successful": False, "error": f"No text content in {tool_name} response item."}
+
+        print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Unhandled result structure from {tool_name}. Raw: {creation_result_from_mcp}{user_interface.Style.RESET_ALL}")
+        return {"successful": False, "error": f"Unexpected result structure from {tool_name} after tool call."}
