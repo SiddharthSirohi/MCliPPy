@@ -3,7 +3,8 @@ import google.generativeai as genai
 import json
 import traceback
 import asyncio
-import config_manager # For GOOGLE_API_KEY in test stub
+import config_manager
+import calendar_utils
 from typing import Dict, List, Optional, Any, Tuple
 
 
@@ -262,7 +263,8 @@ async def draft_email_reply_with_llm(
     action_sentiment: str,
     user_persona: str,
     user_priorities: str,
-    user_edit_instructions: Optional[str] = None
+    user_edit_instructions: Optional[str] = None,
+    available_slots: Optional[List[Dict[str, str]]] = None
 ) -> Dict[str, str]:
 
     if not original_email_data:
@@ -385,11 +387,32 @@ async def draft_email_reply_with_llm(
         "\nEnsure the body is plain text. Do not include any other explanatory text outside the JSON object."
     )
 
+    if available_slots:
+        prompt_construction_parts.append("\nThe user has indicated they are free during the following time slots. If relevant to the reply sentiment (e.g., proposing meeting times), please pick 1-3 suitable options from this list and incorporate them naturally into the email body. Format them readably (e.g., 'June 3rd from 2:00 PM to 3:00 PM IST').")
+        prompt_construction_parts.append("Available Slots:")
+        for slot in available_slots[:5]: # Show a few to the LLM
+            # We need a readable format for the LLM here
+            start_dt = calendar_utils.parse_iso_to_ist(slot["start"])
+            end_dt = calendar_utils.parse_iso_to_ist(slot["end"])
+            if start_dt and end_dt:
+                # Example: "Monday, June 03, 2025, from 10:00 AM to 10:30 AM IST"
+                slot_text = f"- {start_dt.strftime('%A, %B %d, %Y, from %I:%M %p')} to {end_dt.strftime('%I:%M %p %Z')}"
+                prompt_construction_parts.append(slot_text)
+    # +++++++++++++ END OF CONDITIONAL SLOTS +++++++++++++
+
+    prompt_construction_parts.append(
+        # ... (rest of the JSON output instruction and example, same as before) ...
+        "\nBased on this, please generate:"
+        "\n1. A suitable reply \"subject\" line (usually \"Re: [original subject]\")."
+        "\n2. A professional and concise email \"body\" for the reply."
+        # ...
+    )
     final_prompt_for_llm = "\n".join(prompt_construction_parts)
+
 
     response_text_for_debugging = "Gemini call for draft did not occur or failed."
     try:
-        # print(f"LLM_PROCESSOR (Draft Reply Debug): Final Prompt Sent:\n{final_prompt_for_llm}") # For debugging if needed
+        # print(f"LLM_PROCESSOR (Draft Reply DEBUG): Final Prompt Sent:\n{final_prompt_for_llm}")
         response = await gemini_llm_model.generate_content_async(final_prompt_for_llm)
         response_text_for_debugging = response.text
 
@@ -402,9 +425,9 @@ async def draft_email_reply_with_llm(
             return {
                 "subject": draft_data["subject"],
                 "body": draft_data["body"],
-                "recipient_email_for_reply": original_sender_email_only, # CRITICAL: Use the parsed email
+                "recipient_email_for_reply": original_sender_email_only,
                 "original_thread_id": original_thread_id,
-                "error": None
+                "error": None # Explicitly None
             }
         else:
             print(f"LLM_PROCESSOR (Draft Reply): LLM response was not a dict with subject/body: {draft_data}")
@@ -416,7 +439,6 @@ async def draft_email_reply_with_llm(
     except Exception as e:
         print(f"LLM_PROCESSOR (Draft Reply): Error during Gemini API call for draft: {e}")
         print(f"LLM_PROCESSOR (Draft Reply): Raw response (if available): {response_text_for_debugging}")
-        # traceback.print_exc() # Uncomment for full traceback if needed
         return {"error": f"LLM API call error for draft: {str(e)}"}
 
 async def parse_event_creation_details_from_suggestion(

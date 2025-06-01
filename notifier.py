@@ -1,11 +1,6 @@
-# notifier.py
 import subprocess
 import platform
 
-# PM Consideration: Make notifications concise and actionable.
-# The title should immediately tell the user what the notification is about.
-# The message should give a quick summary of what needs attention.
-# We could also consider adding a subtitle or sound, but let's keep it simple for MVP.
 
 def send_macos_notification(title: str, message: str, subtitle: str = None, sound: bool = False):
     """
@@ -20,7 +15,7 @@ def send_macos_notification(title: str, message: str, subtitle: str = None, soun
         command = ['terminal-notifier', '-title', title, '-message', message]
         if subtitle:
             command.extend(['-subtitle', subtitle])
-        if sound: # PM: Sound can be good for urgent, but off by default to be less intrusive.
+        if sound:
             command.extend(['-sound', 'default'])
 
         # PM: Add an app icon for better visual identity (if we had one)

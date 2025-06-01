@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Any, Tuple
 
 import config_manager
 import user_interface
+import calendar_utils
 
 COMPOSIO_AUTH_INIT_TOOL = "COMPOSIO_INITIATE_CONNECTION"
 
@@ -169,6 +170,112 @@ class McpSessionManager:
             if "Method not found" in str(e) and COMPOSIO_AUTH_INIT_TOOL in str(e): # Highly unlikely
                  print(f"MCP_SM ({self.app_name}): Auth tool itself not found, check MCP server config.")
             return {"error": str(e), "exception": True}
+
+    async def get_calendar_free_slots(
+        self,
+        time_min_iso_ist: str,    # e.g., "2025-06-02T09:00:00+05:30"
+        time_max_iso_ist: str,    # e.g., "2025-06-02T18:00:00+05:30"
+        meeting_duration_minutes: int,
+        calendar_id: str = "primary"
+    ) -> Dict[str, Any]:
+        """
+        Calls Composio's GOOGLECALENDAR_FIND_FREE_SLOTS, then uses calendar_utils
+        to calculate and return a list of free slots.
+        Returns {"successful": True, "free_slots": list_of_slots} or
+                {"successful": False, "error": "message"}
+        Each slot in list_of_slots is a dict: {"start": "iso_str_ist", "end": "iso_str_ist"}
+        """
+        if not self.session:
+            return {"error": "No active Calendar MCP session.", "successful": False}
+
+        tool_name = "GOOGLECALENDAR_FIND_FREE_SLOTS"
+        if tool_name not in self.tools:
+            msg = f"Tool '{tool_name}' not available in cached tools. Check Composio allowed_tools."
+            print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg}{user_interface.Style.RESET_ALL}")
+            return {"error": msg, "successful": False}
+
+        params = {
+            "time_min": time_min_iso_ist,
+            "time_max": time_max_iso_ist,
+            "timezone": "Asia/Kolkata", # Hardcoded as per requirement
+            "items": [calendar_id], # List containing the calendar ID, usually "primary"
+            "calendar_expansion_max": 1, # As per your successful payload
+            "group_expansion_max": 0     # As per your successful payload
+        }
+
+        print(f"MCP_SM ({self.app_name}): Attempting to call '{tool_name}' with params: {params}")
+
+        find_slots_outcome = await self.ensure_auth_and_call_tool(tool_name, params)
+
+        # Debug print for the raw outcome
+        print(f"MCP_SM ({self.app_name}): Raw outcome from {tool_name}:")
+        if isinstance(find_slots_outcome, dict):
+            print(json.dumps(find_slots_outcome, indent=2))
+        elif find_slots_outcome and hasattr(find_slots_outcome, 'content'):
+            print(f"  ToolCallResult.content: {find_slots_outcome.content}")
+            if find_slots_outcome.content and hasattr(find_slots_outcome.content[0], 'text'):
+                print(f"  First content item text: {getattr(find_slots_outcome.content[0], 'text', None)}")
+        else:
+            print(f"  Outcome was None or unexpected structure: {find_slots_outcome}")
+
+
+        # 1. Handle direct error dicts from ensure_auth_and_call_tool
+        if isinstance(find_slots_outcome, dict) and find_slots_outcome.get("error"):
+            return find_slots_outcome
+
+        # 2. Process ToolCallResult
+        if find_slots_outcome and hasattr(find_slots_outcome, 'content') and find_slots_outcome.content:
+            text_content = getattr(find_slots_outcome.content[0], 'text', None)
+            if text_content:
+                try:
+                    composio_response = json.loads(text_content)
+                    print(f"DEBUG_MCP_HANDLER (FindFreeSlots): Parsed composio_response: {json.dumps(composio_response, indent=2)}")
+
+                    if composio_response.get("successful") is True:
+                        response_data = composio_response.get("data", {}).get("response_data", {})
+                        busy_slots_for_calendar = response_data.get("calendars", {}).get(calendar_id, {}).get("busy", [])
+
+                        query_start_dt = calendar_utils.parse_iso_to_ist(time_min_iso_ist)
+                        query_end_dt = calendar_utils.parse_iso_to_ist(time_max_iso_ist)
+
+                        if not query_start_dt or not query_end_dt:
+                            msg = "Invalid time_min or time_max provided for free slot calculation."
+                            print(f"{user_interface.Fore.RED}{msg}{user_interface.Style.RESET_ALL}")
+                            return {"successful": False, "error": msg}
+
+                        free_slots = calendar_utils.calculate_free_slots(
+                            query_start_dt_ist=query_start_dt,
+                            query_end_dt_ist=query_end_dt,
+                            busy_slots_data=busy_slots_for_calendar,
+                            meeting_duration_minutes=meeting_duration_minutes
+                            # workday_start_hour and workday_end_hour use defaults from calendar_utils
+                        )
+                        print(f"{user_interface.Fore.GREEN}Successfully found {len(free_slots)} free slot(s).{user_interface.Style.RESET_ALL}")
+                        return {"successful": True, "free_slots": free_slots}
+
+                    elif composio_response.get("successful") is False and composio_response.get("error") is not None:
+                        error_msg = str(composio_response.get("error"))
+                        print(f"{user_interface.Fore.RED}Composio tool '{tool_name}' reported failure: {error_msg}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": error_msg, "composio_reported_error": True}
+                    else:
+                        msg = f"Composio response for {tool_name} did not indicate clear success or provide a specific error."
+                        print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {msg} Response: {json.dumps(composio_response, indent=2)}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": msg}
+
+                except json.JSONDecodeError:
+                    msg = f"Could not parse {tool_name} JSON response."
+                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg} Raw: {text_content[:200]}...{user_interface.Style.RESET_ALL}")
+                    return {"successful": False, "error": msg}
+            else:
+                msg = f"No text content in {tool_name} response item."
+                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {msg}{user_interface.Style.RESET_ALL}")
+                return {"successful": False, "error": msg}
+
+        # 3. Fallback
+        msg = f"Unexpected result structure from {tool_name} after tool call."
+        print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg} Raw: {find_slots_outcome}{user_interface.Style.RESET_ALL}")
+        return {"successful": False, "error": msg}
+
 
     async def reply_to_gmail_thread(
         self,

@@ -265,6 +265,20 @@ def get_send_edit_cancel_confirmation(draft_text: str, service_name: str = "emai
             return "cancel"
         print(f"{Fore.RED}Invalid choice. Please enter S, E, or C.{Style.RESET_ALL}")
 
+
+def display_free_slots(free_slots_list: List[Dict[str, str]], for_date_str: str):
+    """Displays a list of free time slots."""
+    print_header(f"Available Free Slots for {for_date_str}")
+    if not free_slots_list:
+        print(f"{Fore.YELLOW}No free slots found for the specified duration and date.{Style.RESET_ALL}")
+        return
+
+    for i, slot in enumerate(free_slots_list):
+        start_display = format_datetime_for_display(slot.get("start"))
+        end_display = format_datetime_for_display(slot.get("end"))
+        print(f"  {Style.BRIGHT}{i+1}.{Style.RESET_ALL} {Fore.GREEN}{start_display}{Style.RESET_ALL} to {Fore.GREEN}{end_display}{Style.RESET_ALL}")
+    print("-" * 10)
+
 def get_event_update_choices(original_event_summary: str, original_event_details: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     print_header(f"Update Event: {original_event_summary[:50]}...")
     updates: Dict[str, Any] = {} # Ensure updates is always a dict
@@ -281,6 +295,7 @@ def get_event_update_choices(original_event_summary: str, original_event_details
         "5": {"name": "Location", "key": "location", "type": "str"},
         "6": {"name": "Attendees (comma-separated emails)", "key": "attendees", "type": "email_list"},
         "7": {"name": "Google Meet Link (Add/Ensure)", "key": "create_meeting_room", "type": "bool_true"},
+        "f": {"name": "Find & Display Free Slots", "key": "find_free_slots_trigger", "type": "action_trigger"}
     }
 
     while True:
@@ -293,7 +308,11 @@ def get_event_update_choices(original_event_summary: str, original_event_details
                  current_val_indicator = f" (current: {Fore.YELLOW}True{Style.RESET_ALL})"
             elif val_info['key'] == "duration" and ("event_duration_hour" in updates or "event_duration_minutes" in updates):
                  current_val_indicator = f" (current: {Fore.YELLOW}{updates.get('event_duration_hour',0)}h {updates.get('event_duration_minutes',0)}m{Style.RESET_ALL})"
-            print(f"  {Style.BRIGHT}{key_choice}{Style.RESET_ALL}. {val_info['name']}{current_val_indicator}")
+            if val_info["type"] == "action_trigger": # Don't show (current: ...) for triggers
+                print(f"  {Style.BRIGHT}{key_choice}{Style.RESET_ALL}. {val_info['name']}")
+            else:
+                print(f"  {Style.BRIGHT}{key_choice}{Style.RESET_ALL}. {val_info['name']}{current_val_indicator}")
+
 
         print(f"  {Style.BRIGHT}s{Style.RESET_ALL}. Save changes and proceed to update")
         print(f"  {Style.BRIGHT}c{Style.RESET_ALL}. Cancel update")
@@ -308,7 +327,10 @@ def get_event_update_choices(original_event_summary: str, original_event_details
 
             # If ANY update is being made, ensure start_datetime, timezone, and duration are present
             # because GOOGLECALENDAR_UPDATE_EVENT marks start_datetime as REQUIRED.
-            needs_base_timing_info = bool(updates)
+            needs_base_timing_info = ("start_datetime" in updates or \
+                                  "event_duration_hour" in updates or \
+                                  "event_duration_minutes" in updates or \
+                                  bool(updates)) # If any update, ensure base timing
 
             if needs_base_timing_info:
                 # Ensure start_datetime is present
@@ -326,21 +348,21 @@ def get_event_update_choices(original_event_summary: str, original_event_details
 
                 # Ensure timezone is present (goes with start_datetime)
                 if "timezone" not in updates:
-                    if original_event_timezone: # From event.start.timeZone
+                    if original_event_timezone:
                         updates["timezone"] = original_event_timezone
-                    elif original_start_iso: # Try to derive from full ISO string's offset if event.start.timeZone missing
-                        try:
+                    elif original_start_iso:
+                         try:
                             dt_obj_for_tz = datetime.fromisoformat(original_start_iso)
                             if dt_obj_for_tz.tzinfo:
-                                # This gets offset like +05:30. Google API/Composio likely needs IANA.
-                                # For robustness, if original_event_timezone (IANA) isn't there, better to prompt or use a default.
+                                # This is an offset, GCal API / Composio tool needs IANA name. Prompt.
                                 updates["timezone"] = get_user_input(f"Enter timezone for start time '{updates['start_datetime']}' (e.g., Asia/Kolkata)", default="UTC")
-                            else: # Naive original, prompt for TZ
+                            else:
                                  updates["timezone"] = get_user_input(f"Enter timezone for start time '{updates['start_datetime']}' (e.g., Asia/Kolkata)", default="UTC")
-                        except ValueError: # Fallback to prompt
-                            updates["timezone"] = get_user_input(f"Enter timezone for start time '{updates['start_datetime']}' (e.g., Asia/Kolkata)", default="UTC")
-                    else: # Fallback to prompt
+                         except ValueError:
+                            updates["timezone"] = get_user_input(f"Enter timezone for start time '{updates.get('start_datetime', 'UNKNOWN')}' (e.g., Asia/Kolkata)", default="UTC")
+                    else:
                         updates["timezone"] = get_user_input(f"Enter timezone for start time '{updates.get('start_datetime', 'UNKNOWN')}' (e.g., Asia/Kolkata)", default="UTC")
+
 
                 # Ensure duration fields are present
                 if "event_duration_hour" not in updates and "event_duration_minutes" not in updates:
@@ -354,14 +376,13 @@ def get_event_update_choices(original_event_summary: str, original_event_details
                             updates["event_duration_hour"] = total_minutes // 60
                             updates["event_duration_minutes"] = total_minutes % 60
                         except ValueError:
-                            updates["event_duration_hour"] = 0
-                            updates["event_duration_minutes"] = 30
+                            updates["event_duration_hour"] = 0; updates["event_duration_minutes"] = 30
                     else:
-                        updates["event_duration_hour"] = 0
-                        updates["event_duration_minutes"] = 30
+                        updates["event_duration_hour"] = 0; updates["event_duration_minutes"] = 30
+
+
             if "summary" not in updates and original_event_details.get("summary"):
                 updates["summary"] = original_event_details.get("summary")
-                print(f"   (DEBUG: Auto-added original summary '{updates['summary']}' to prevent loss)")
 
             return updates
 
@@ -369,6 +390,10 @@ def get_event_update_choices(original_event_summary: str, original_event_details
             field_info = fields_to_update[choice]
             field_key = field_info["key"]
             field_type = field_info["type"]
+
+            if field_type == "action_trigger" and field_key == "find_free_slots_trigger":
+                # Signal to assistant.py to handle this action
+                return {"trigger_action": "find_free_slots"}
 
             if field_type == "str":
                 updates[field_key] = get_user_input(f"Enter new {field_info['name']}")
@@ -397,11 +422,17 @@ def get_event_update_choices(original_event_summary: str, original_event_details
                         print(f"{Fore.RED}Invalid duration values.{Style.RESET_ALL}")
                 except ValueError:
                     print(f"{Fore.RED}Duration must be numbers.{Style.RESET_ALL}")
-            elif field_type == "email_list": # For attendees
-                current_attendees_str = ", ".join(updates.get(field_key, [])) # Current is now list of strings
+            elif field_type == "email_list_str": # Matching my type for attendees as list of strings
+                current_attendees_str = ", ".join(updates.get(field_key, []))
                 emails_str = get_user_input(f"Enter new {field_info['name']} (comma-separated emails)", default=current_attendees_str)
                 attendee_email_strings = [e.strip() for e in emails_str.split(',') if e.strip() and "@" in e]
-                updates[field_key] = attendee_email_strings # Store as list of strings
+                updates[field_key] = attendee_email_strings
+                print(f"   (DEBUG: Attendees to be sent as list of strings: {updates[field_key]})")
+            elif field_type == "email_list_str": # Matching my type for attendees as list of strings
+                current_attendees_str = ", ".join(updates.get(field_key, []))
+                emails_str = get_user_input(f"Enter new {field_info['name']} (comma-separated emails)", default=current_attendees_str)
+                attendee_email_strings = [e.strip() for e in emails_str.split(',') if e.strip() and "@" in e]
+                updates[field_key] = attendee_email_strings
                 print(f"   (DEBUG: Attendees to be sent as list of strings: {updates[field_key]})")
             elif field_type == "bool_true":
                 print(f"DEBUG: Prompting for {field_info['name']}")
@@ -436,6 +467,7 @@ def get_event_creation_confirmation_and_edits(
         "6": {"name": "Location", "key": "location", "type": "str_optional"},
         "7": {"name": "Attendees (comma-separated emails)", "key": "attendees", "type": "email_list_str"}, # List of strings for CREATE tool
         "8": {"name": "Add Google Meet Link", "key": "create_meeting_room", "type": "bool_choice"},
+        "f": {"name": "Find & Suggest Free Slots for Start Time", "key": "find_free_slots_trigger", "type": "action_trigger"}
     }
     # Note: 'str_optional' and 'email_list_str' are for get_user_input prompting, actual type is str/list
     # 'bool_choice' is for get_yes_no_input
@@ -472,6 +504,10 @@ def get_event_creation_confirmation_and_edits(
         if choice in fields_for_creation:
             field_info = fields_for_creation[choice]
             field_key = field_info["key"]
+            field_type = field_info["type"]
+
+            if field_type == "action_trigger" and field_key == "find_free_slots_trigger": # Changed field_key
+                return {"trigger_action": "find_free_slots"}
 
             if field_key == "duration":
                 try:
@@ -481,7 +517,7 @@ def get_event_creation_confirmation_and_edits(
                         current_details["event_duration_hour"] = h
                         current_details["event_duration_minutes"] = m
                 except ValueError: print(f"{Fore.RED}Invalid duration.{Style.RESET_ALL}")
-            elif field_key == "attendees": # Expects list of strings for CREATE_EVENT
+            elif field_key == "attendees":
                 emails_str = get_user_input(f"Enter {field_info['name']}", default=", ".join(current_details.get(field_key,[])))
                 current_details[field_key] = [e.strip() for e in emails_str.split(',') if e.strip() and "@" in e]
             elif field_key == "create_meeting_room":
@@ -489,13 +525,18 @@ def get_event_creation_confirmation_and_edits(
             elif field_key == "start_datetime":
                 new_val = get_user_input(f"Enter new {field_info['name']} (YYYY-MM-DDTHH:MM:SS)", default=current_details.get(field_key))
                 try:
-                    datetime.strptime(new_val, "%Y-%m-%dT%H:%M:%S")
+                    datetime.strptime(new_val, "%Y-%m-%dT%H:%M:%S") # Just validate
                     current_details[field_key] = new_val
+                    # Ensure timezone is also prompted if start_datetime is set and timezone is missing
+                    if "timezone" not in current_details or not current_details["timezone"]:
+                        current_details["timezone"] = get_user_input(f"Enter Timezone for this start time (e.g., Asia/Kolkata)", default=current_details.get("timezone", "Asia/Kolkata"))
                 except ValueError: print(f"{Fore.RED}Invalid datetime format.{Style.RESET_ALL}")
-            else: # For 'summary', 'timezone', 'description', 'location'
+            else:
                 current_details[field_key] = get_user_input(f"Enter new {field_info['name']}", default=current_details.get(field_key))
+
         else:
             print(f"{Fore.RED}Invalid choice.{Style.RESET_ALL}")
+
 
 if __name__ == "__main__":
     print("--- Testing user_interface.py ---")

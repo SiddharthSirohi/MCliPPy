@@ -14,8 +14,10 @@ import google.generativeai as genai # For Gemini
 import config_manager
 from mcp_handler import McpSessionManager
 import llm_processor
-import notifier # Added
-import user_interface # Added
+import notifier
+import user_interface
+import calendar_utils
+
 
 # --- Helper for User Input & Signup Flow (from user_interface.py now) ---
 # These are called from user_interface.py, so no need to redefine here.
@@ -293,31 +295,99 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
     print(f"{user_interface.Style.DIM}Proactive checks cycle complete.{user_interface.Style.RESET_ALL}")
     return True, important_emails_llm_data, processed_events_llm_data
 
-# assistant.py
-# ...
 
 async def handle_draft_email_reply(
     gemini_llm_model,
     chosen_email_data: Dict[str, Any],
     initial_llm_action_text: str,
-    user_config: Dict[str, Any],
-    gmail_mcp_manager: McpSessionManager
-):
-    user_persona = user_config.get(config_manager.USER_PERSONA_KEY)
-    user_priorities = user_config.get(config_manager.USER_PRIORITIES_KEY)
+    user_config: Dict[str, Any]
+    # No McpSessionManagers passed in directly; they will be created internally for actions
+) -> bool: # Returns True if action was processed (even if cancelled by user), False on critical error
+    user_persona = user_config.get(config_manager.USER_PERSONA_KEY, "a professional")
+    user_priorities = user_config.get(config_manager.USER_PRIORITIES_KEY, "key tasks")
+
+    # Get URLs and user_id for potential MCP calls
+    gmail_mcp_url = user_config.get(config_manager.GMAIL_MCP_URL_KEY)
+    calendar_mcp_url = user_config.get(config_manager.CALENDAR_MCP_URL_KEY) # For finding slots
+    user_id = user_config.get(config_manager.USER_EMAIL_KEY)
 
     current_draft_info = None
-    user_edit_instructions = None # Store edit instructions for LLM
+    available_slots_for_llm: Optional[List[Dict[str, str]]] = None
 
-    print(f"\n{user_interface.Style.DIM}Drafting reply for '{chosen_email_data['original_email_data'].get('subject', 'N/A')}' based on action: '{initial_llm_action_text}'...{user_interface.Style.RESET_ALL}")
+    # --- Conditionally Find Free Slots ---
+    if calendar_mcp_url and user_id and \
+       ("availability" in initial_llm_action_text.lower() or \
+        "times" in initial_llm_action_text.lower() or \
+        "slots" in initial_llm_action_text.lower() or \
+        "propose" in initial_llm_action_text.lower() or \
+        "slot" in initial_llm_action_text.lower() or \
+        "time" in initial_llm_action_text.lower() or \
+        "free" in initial_llm_action_text.lower() or \
+        "suggest time" in initial_llm_action_text.lower()):
+
+        if user_interface.get_yes_no_input("Do you want to check your calendar for free slots to suggest in this email reply?", default_yes=True):
+            date_str = user_interface.get_user_input("Enter date to find free slots (YYYY-MM-DD, 'today', 'tomorrow')", default="today")
+            duration_str = user_interface.get_user_input("Desired meeting duration for slots (e.g., 30m, 1h)", default="30m")
+
+            meeting_duration_minutes = 30
+            try:
+                if 'h' in duration_str:
+                    parts = duration_str.split('h')
+                    hours = int(parts[0])
+                    minutes_part = parts[1].replace('m','')
+                    minutes = int(minutes_part) if minutes_part else 0
+                    meeting_duration_minutes = (hours * 60) + minutes
+                elif 'm' in duration_str:
+                    meeting_duration_minutes = int(duration_str.replace('m',''))
+            except ValueError: meeting_duration_minutes = 30 # Default on parse error
+
+            target_date = None
+            now_ist = datetime.now(calendar_utils.IST)
+            if date_str.lower() == "today": target_date = now_ist.date()
+            elif date_str.lower() == "tomorrow": target_date = (now_ist + timedelta(days=1)).date()
+            else:
+                try: target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                except ValueError: print(f"{user_interface.Fore.RED}Invalid date format for finding slots.{user_interface.Style.RESET_ALL}")
+
+            if target_date:
+                time_min_dt = datetime(target_date.year, target_date.month, target_date.day, 9, 0, 0, tzinfo=calendar_utils.IST)
+                time_max_dt = datetime(target_date.year, target_date.month, target_date.day, 18, 0, 0, tzinfo=calendar_utils.IST)
+                time_min_iso = calendar_utils.format_datetime_to_iso_ist(time_min_dt)
+                time_max_iso = calendar_utils.format_datetime_to_iso_ist(time_max_dt)
+                parsed_target_date_str = target_date.strftime("%Y-%m-%d")
+
+                print(f"{user_interface.Style.DIM}Establishing session to find free slots...{user_interface.Style.RESET_ALL}")
+                async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-findslots-for-email") as slot_finder_manager:
+                    if slot_finder_manager.session:
+                        free_slots_result = await slot_finder_manager.get_calendar_free_slots(
+                            time_min_iso, time_max_iso, meeting_duration_minutes
+                        )
+                        if free_slots_result.get("successful"):
+                            available_slots_for_llm = free_slots_result.get("free_slots", [])
+                            if available_slots_for_llm:
+                                print(f"{user_interface.Fore.GREEN}Found {len(available_slots_for_llm)} free slots. They will be provided to the LLM.{user_interface.Style.RESET_ALL}")
+                                user_interface.display_free_slots(available_slots_for_llm, parsed_target_date_str)
+                            else:
+                                print(f"{user_interface.Fore.YELLOW}No free slots found for the specified criteria.{user_interface.Style.RESET_ALL}")
+                        else:
+                            print(f"{user_interface.Fore.RED}Error finding free slots: {free_slots_result.get('error')}{user_interface.Style.RESET_ALL}")
+                    else:
+                        print(f"{user_interface.Fore.RED}Could not establish session to find free slots.{user_interface.Style.RESET_ALL}")
+            # If target_date was not set due to invalid input, available_slots_for_llm remains None
+
+    # Initial draft generation
+    print(f"\n{user_interface.Style.DIM}Drafting reply for '{chosen_email_data['original_email_data'].get('subject', 'N/A')}'...{user_interface.Style.RESET_ALL}")
     current_draft_info = await llm_processor.draft_email_reply_with_llm(
         gemini_llm_model,
         chosen_email_data['original_email_data'],
         initial_llm_action_text,
         user_persona,
-        user_priorities
+        user_priorities,
+        user_edit_instructions=None,
+        available_slots=available_slots_for_llm
     )
 
+    # Edit/Send/Cancel loop
     while True:
         if not current_draft_info or current_draft_info.get("error"):
             error_msg = current_draft_info.get("error", "Failed to generate draft.") if current_draft_info else "Failed to generate draft."
@@ -325,46 +395,45 @@ async def handle_draft_email_reply(
             return False
 
         draft_body = current_draft_info.get("body")
-        draft_subject = current_draft_info.get("subject") # Still useful for context and save_draft
+        draft_subject = current_draft_info.get("subject")
 
-        # Use the new confirmation function
         confirmation_choice = user_interface.get_send_edit_cancel_confirmation(
             f"Subject: {draft_subject}\n\n{draft_body}",
             service_name="Email Reply"
         )
 
         if confirmation_choice == "send_reply":
-            print(f"{user_interface.Style.DIM}Preparing to send reply via Gmail...{user_interface.Style.RESET_ALL}")
             recipient_for_reply = current_draft_info.get("recipient_email_for_reply")
             original_thread_id = current_draft_info.get("original_thread_id")
-            draft_body = current_draft_info.get("body") # Make sure body is also fetched
 
-            # CRITICAL CHECK FOR RECIPIENT
             if not recipient_for_reply or recipient_for_reply == "Unknown Sender" or "@" not in recipient_for_reply:
                  print(f"{user_interface.Fore.RED}Cannot send reply: Valid recipient email not found. Found: '{recipient_for_reply}'{user_interface.Style.RESET_ALL}")
-                 return False # Critical info missing
-
+                 return False
             if not original_thread_id or not draft_body:
                  print(f"{user_interface.Fore.RED}Critical reply information missing (thread ID or body). Cannot send.{user_interface.Style.RESET_ALL}")
                  return False
-
-            if not gmail_mcp_manager or not gmail_mcp_manager.session:
-                print(f"{user_interface.Fore.RED}Gmail MCP session not available. Cannot send reply.{user_interface.Style.RESET_ALL}")
+            if not gmail_mcp_url or not user_id:
+                print(f"{user_interface.Fore.RED}Gmail configuration missing. Cannot send reply.{user_interface.Style.RESET_ALL}")
                 return False
 
-            send_reply_outcome = await gmail_mcp_manager.reply_to_gmail_thread(
-                thread_id=original_thread_id,
-                recipient_email=recipient_for_reply, # Original sender
-                message_body=draft_body
-            )
+            print(f"{user_interface.Style.DIM}Establishing session to send Gmail reply...{user_interface.Style.RESET_ALL}")
+            async with McpSessionManager(gmail_mcp_url, user_id, "gmail-action-send-reply") as exec_gmail_manager:
+                if not exec_gmail_manager.session:
+                    print(f"{user_interface.Fore.RED}Failed to establish Gmail session for sending reply.{user_interface.Style.RESET_ALL}")
+                    return False
+
+                send_reply_outcome = await exec_gmail_manager.reply_to_gmail_thread(
+                    thread_id=original_thread_id,
+                    recipient_email=recipient_for_reply,
+                    message_body=draft_body
+                )
+
             if send_reply_outcome.get("successful"):
                 print(f"{user_interface.Fore.GREEN}Success! {send_reply_outcome.get('message', 'Reply sent.')}{user_interface.Style.RESET_ALL}")
                 return True
             else:
                 error_msg = send_reply_outcome.get('error', 'Failed to send reply via MCP.')
-                print(f"{user_interface.Fore.RED}MCP Error: {error_msg}{user_interface.Style.RESET_ALL}")
-                # if send_reply_outcome.get("needs_user_action"): # Handled by ensure_auth_and_call_tool
-                #     print(f"{user_interface.Fore.YELLOW}Gmail authentication might be required again.{user_interface.Style.RESET_ALL}")
+                print(f"{user_interface.Fore.RED}MCP Error sending reply: {error_msg}{user_interface.Style.RESET_ALL}")
                 return False
 
         elif confirmation_choice == "edit":
@@ -376,30 +445,29 @@ async def handle_draft_email_reply(
                 initial_llm_action_text,
                 user_persona,
                 user_priorities,
-                user_edit_instructions=user_edit_instructions
+                user_edit_instructions=user_edit_instructions,
+                available_slots=available_slots_for_llm
             )
-            # Loop continues to show new draft
+            # Loop continues
 
         elif confirmation_choice == "cancel":
             print(f"{user_interface.Fore.YELLOW}Drafting and replying cancelled.{user_interface.Style.RESET_ALL}")
             return True
 
         else:
-            print(f"{user_interface.Fore.RED}Unknown confirmation choice.{user_interface.Style.RESET_ALL}")
+            print(f"{user_interface.Fore.RED}Unknown confirmation choice in email reply handler.{user_interface.Style.RESET_ALL}")
             return False
 
-# ... (rest of assistant.py, especially main_assistant_entry, remains the same for now) ...
-# The logic in main_assistant_entry that calls handle_draft_email_reply is fine.
+# assistant.py
 
 async def handle_delete_calendar_event(
     chosen_event_data: Dict[str, Any],
-    user_config: Dict[str, Any],
-    calendar_mcp_manager: McpSessionManager # Pass the manager
-):
+    user_config: Dict[str, Any]
+    # REMOVE calendar_mcp_manager from parameters
+) -> bool:
     original_event_details = chosen_event_data.get("original_event_data", {})
     event_id_to_delete = original_event_details.get("id")
     event_title = original_event_details.get("summary", "Unknown Event")
-    # calendar_id = original_event_details.get("calendarId", "primary") # From sample, calendarId isn't directly on event object
 
     if not event_id_to_delete:
         print(f"{user_interface.Fore.RED}Error: Could not find Event ID for '{event_title}'. Cannot delete.{user_interface.Style.RESET_ALL}")
@@ -411,33 +479,36 @@ async def handle_delete_calendar_event(
     )
 
     if confirm_delete:
-        print(f"{user_interface.Style.DIM}Attempting to delete calendar event '{event_title}'...{user_interface.Style.RESET_ALL}")
-        if not calendar_mcp_manager or not calendar_mcp_manager.session:
-            print(f"{user_interface.Fore.RED}Calendar MCP session not available. Cannot delete event.{user_interface.Style.RESET_ALL}")
+        calendar_mcp_url = user_config.get(config_manager.CALENDAR_MCP_URL_KEY)
+        user_id = user_config.get(config_manager.USER_EMAIL_KEY)
+        if not calendar_mcp_url or not user_id:
+            print(f"{user_interface.Fore.RED}Calendar configuration missing for delete action.{user_interface.Style.RESET_ALL}")
             return False
 
-        delete_outcome = await calendar_mcp_manager.delete_calendar_event(event_id=event_id_to_delete) # Defaults to primary calendar
+        print(f"{user_interface.Style.DIM}Establishing session to delete calendar event '{event_title}'...{user_interface.Style.RESET_ALL}")
+        async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-delete-EXECUTE") as exec_cal_manager:
+            if not exec_cal_manager.session:
+                print(f"{user_interface.Fore.RED}Failed to establish session for deleting event.{user_interface.Style.RESET_ALL}")
+                return False
+
+            delete_outcome = await exec_cal_manager.delete_calendar_event(event_id=event_id_to_delete)
 
         if delete_outcome.get("successful"):
             print(f"{user_interface.Fore.GREEN}Success! {delete_outcome.get('message', f'Event {event_title} deleted.')}{user_interface.Style.RESET_ALL}")
-            # PM: Consider re-fetching calendar events here to update the UI immediately, or mark as deleted locally.
-            # For now, the next cycle of perform_proactive_checks will show the updated calendar.
             return True
         else:
             error_msg = delete_outcome.get('error', 'Failed to delete event via MCP.')
-            print(f"{user_interface.Fore.RED}MCP Error: {error_msg}{user_interface.Style.RESET_ALL}")
-            # if delete_outcome.get("needs_user_action"): (handled by ensure_auth_and_call_tool)
+            print(f"{user_interface.Fore.RED}MCP Error deleting event: {error_msg}{user_interface.Style.RESET_ALL}")
             return False
     else:
         print(f"{user_interface.Fore.YELLOW}Event deletion cancelled by user.{user_interface.Style.RESET_ALL}")
-        return True # User cancelled, not a failure of the action itself
+        return True
 
 async def handle_update_calendar_event(
     chosen_event_data: Dict[str, Any],
-    user_config: Dict[str, Any], # For user_id, calendar_mcp_url
-    calendar_mcp_manager: McpSessionManager,
-    # llm_parsed_updates: Optional[Dict[str, Any]] = None # For when LLM suggests specific changes
-):
+    user_config: Dict[str, Any]
+    # No McpSessionManager passed directly for the whole function's lifetime
+) -> bool:
     original_event_details = chosen_event_data.get("original_event_data", {})
     event_id_to_update = original_event_details.get("id")
     event_title = original_event_details.get("summary", "Unknown Event")
@@ -446,58 +517,131 @@ async def handle_update_calendar_event(
         print(f"{user_interface.Fore.RED}Error: Could not find Event ID for '{event_title}'. Cannot update.{user_interface.Style.RESET_ALL}")
         return False
 
-    # For now, always go to manual update menu.
-    # Later, if llm_parsed_updates is rich, we can confirm those first.
-    updates_from_user = user_interface.get_event_update_choices(
-        event_title,
-        original_event_details # Pass the original event details
-    )
-
-    if not updates_from_user: # User cancelled or made no changes
-        print(f"{user_interface.Fore.YELLOW}Event update cancelled or no changes specified.{user_interface.Style.RESET_ALL}")
-        return True # User cancelled, not a failure
-
-    print(f"{user_interface.Style.DIM}Attempting to update calendar event '{event_title}'...{user_interface.Style.RESET_ALL}")
-
-    update_outcome = await calendar_mcp_manager.update_calendar_event(
-        event_id=event_id_to_update,
-        updates=updates_from_user
-    )
-
-    if update_outcome.get("successful"):
-        print(f"{user_interface.Fore.GREEN}Success! {update_outcome.get('message', f'Event {event_title} updated.')}{user_interface.Style.RESET_ALL}")
-        # updated_event_display = update_outcome.get("updated_event", {}) # If Composio returns full updated event
-        # print(f"Updated event details: {json.dumps(updated_event_display, indent=2)}")
-        return True
-    else:
-        error_msg = update_outcome.get('error', 'Failed to update event via MCP.')
-        print(f"{user_interface.Fore.RED}MCP Error: {error_msg}{user_interface.Style.RESET_ALL}")
+    # Get calendar URL and user_id for potential MCP calls
+    calendar_mcp_url = user_config.get(config_manager.CALENDAR_MCP_URL_KEY)
+    user_id = user_config.get(config_manager.USER_EMAIL_KEY)
+    if not calendar_mcp_url or not user_id:
+        print(f"{user_interface.Fore.RED}Calendar configuration missing. Cannot perform calendar actions.{user_interface.Style.RESET_ALL}")
         return False
 
+    # Loop to allow finding free slots and then returning to edit/confirm updates
+    # This loop primarily collects data into `current_update_payload`
+    current_update_payload: Optional[Dict[str, Any]] = {} # Start with empty updates
+
+    while True:
+        # Pass current_update_payload to UI so it can show current staged changes
+        # get_event_update_choices needs to be adapted to take current_update_payload
+        # and merge new edits into it or use its values as defaults.
+        # For simplicity now, let's assume get_event_update_choices starts fresh each time
+        # OR that it returns the *complete set of updates* the user wants for the save action.
+        # The version of get_event_update_choices you have does build up 'updates' internally.
+
+        ui_outcome = user_interface.get_event_update_choices( # This function builds the 'updates' dict
+            event_title,
+            original_event_details
+        )
+
+        if not ui_outcome: # User cancelled the entire update process from the menu
+            print(f"{user_interface.Fore.YELLOW}Event update cancelled.{user_interface.Style.RESET_ALL}")
+            return True # User action, not a failure
+
+        if isinstance(ui_outcome, dict) and ui_outcome.get("trigger_action") == "find_free_slots":
+            # ... (logic to ask for date/duration for find_free_slots) ...
+            # ... (call mcp_handler.get_calendar_free_slots by opening a temp McpSessionManager) ...
+            print(f"\n{user_interface.Style.DIM}Finding free slots for '{event_title}'...{user_interface.Style.RESET_ALL}")
+            date_str = user_interface.get_user_input("Enter date (YYYY-MM-DD, 'today', 'tomorrow')", default="today")
+            duration_str = user_interface.get_user_input("Desired duration (e.g., 30m, 1h)", default="30m")
+            # Parse date_str and duration_str...
+            # ... (same parsing as in handle_create_calendar_event) ...
+            meeting_duration_minutes = 30 # Placeholder
+            time_min_iso, time_max_iso, parsed_target_date_str = "","","" # Placeholder
+            # (Full date/duration parsing and time_min/max construction needed here)
+            try:
+                _meeting_duration_minutes = 30
+                if 'h' in duration_str:
+                    _hours = int(duration_str.split('h')[0])
+                    _minutes_part = duration_str.split('h')[1].replace('m','')
+                    _minutes = int(_minutes_part) if _minutes_part else 0
+                    _meeting_duration_minutes = (_hours * 60) + _minutes
+                elif 'm' in duration_str:
+                    _meeting_duration_minutes = int(duration_str.replace('m',''))
+
+                _target_date = None
+                _now_ist = datetime.now(calendar_utils.IST)
+                if date_str.lower() == "today": _target_date = _now_ist.date()
+                elif date_str.lower() == "tomorrow": _target_date = (_now_ist + timedelta(days=1)).date()
+                else: _target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+
+                _time_min_dt = datetime(_target_date.year, _target_date.month, _target_date.day, 9,0,0, tzinfo=calendar_utils.IST)
+                _time_max_dt = datetime(_target_date.year, _target_date.month, _target_date.day, 18,0,0, tzinfo=calendar_utils.IST)
+                time_min_iso = calendar_utils.format_datetime_to_iso_ist(_time_min_dt)
+                time_max_iso = calendar_utils.format_datetime_to_iso_ist(_time_max_dt)
+                parsed_target_date_str = _target_date.strftime("%Y-%m-%d")
+                meeting_duration_minutes = _meeting_duration_minutes
+
+
+                async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-findslots-in-update") as slot_finder_manager:
+                    if slot_finder_manager.session:
+                        free_slots_result = await slot_finder_manager.get_calendar_free_slots(
+                            time_min_iso, time_max_iso, meeting_duration_minutes
+                        )
+                        if free_slots_result.get("successful"):
+                            user_interface.display_free_slots(free_slots_result.get("free_slots", []), parsed_target_date_str)
+                        else:
+                            print(f"{user_interface.Fore.RED}Error finding free slots: {free_slots_result.get('error')}{user_interface.Style.RESET_ALL}")
+                    else:
+                        print(f"{user_interface.Fore.RED}Could not establish session to find free slots.{user_interface.Style.RESET_ALL}")
+            except ValueError:
+                 print(f"{user_interface.Fore.RED}Invalid date or duration for finding slots.{user_interface.Style.RESET_ALL}")
+
+
+            print(f"\n{user_interface.Style.DIM}You can now use this information to set 'Start Datetime' and 'Duration'.{user_interface.Style.RESET_ALL}")
+            current_update_payload = {} # Reset updates as user will re-enter or confirm them
+            continue # Go back to "What would you like to update?" menu
+
+        # If it's not a trigger, it's the 'updates' dictionary from user pressing 's'
+        final_updates_for_api = ui_outcome
+
+        print(f"{user_interface.Style.DIM}Establishing session to update calendar event '{event_title}'...{user_interface.Style.RESET_ALL}")
+        async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-update-EXECUTE") as exec_cal_manager:
+            if not exec_cal_manager.session:
+                print(f"{user_interface.Fore.RED}Failed to establish session for final update.{user_interface.Style.RESET_ALL}")
+                return False # Critical failure
+
+            print(f"{user_interface.Style.DIM}Attempting to commit updates: {final_updates_for_api}...{user_interface.Style.RESET_ALL}")
+            update_outcome = await exec_cal_manager.update_calendar_event(
+                event_id=event_id_to_update,
+                updates=final_updates_for_api
+            )
+
+        if update_outcome.get("successful"):
+            print(f"{user_interface.Fore.GREEN}Success! {update_outcome.get('message', f'Event {event_title} updated.')}{user_interface.Style.RESET_ALL}")
+            return True
+        else:
+            error_msg = update_outcome.get('error', 'Failed to update event via MCP.')
+            print(f"{user_interface.Fore.RED}MCP Error updating event: {error_msg}{user_interface.Style.RESET_ALL}")
+            return False
+
 async def handle_create_calendar_event(
-    gemini_llm_model, # The initialized Gemini model instance
-    llm_suggestion_text: str, # e.g., "Create event: 'Team Sync' Tuesday 3pm with john@example.com"
-                              # or "Schedule a 30-min follow-up for Project Alpha"
-    original_context_text: Optional[str], # e.g., email body or original event summary
-    user_config: Dict[str, Any],
-    calendar_mcp_manager: McpSessionManager # The active McpSessionManager for Calendar
-) -> bool: # Returns True if action was processed (even if cancelled by user), False on critical error
-    """
-    Handles the workflow for creating a new calendar event based on an LLM suggestion.
-    """
+    gemini_llm_model,
+    llm_suggestion_text: str,
+    original_context_text: Optional[str],
+    user_config: Dict[str, Any]
+    # No McpSessionManager passed directly
+) -> bool:
     user_persona = user_config.get(config_manager.USER_PERSONA_KEY, "a professional")
     user_priorities = user_config.get(config_manager.USER_PRIORITIES_KEY, "key tasks")
-
-    # Get current time to help LLM resolve relative dates/times in its parsing
-    # The LLM needs current time in UTC preferably, or with explicit timezone
-    # Google API event times are often handled with specific timezones or UTC.
-    # Let's provide UTC to the LLM for parsing, and then handle timezone in UI/MCP call.
     current_time_for_llm_context = datetime.now(timezone.utc).isoformat()
 
+    calendar_mcp_url = user_config.get(config_manager.CALENDAR_MCP_URL_KEY) # For MCP calls
+    user_id = user_config.get(config_manager.USER_EMAIL_KEY)
+    if not calendar_mcp_url or not user_id:
+        print(f"{user_interface.Fore.RED}Calendar configuration missing. Cannot create event.{user_interface.Style.RESET_ALL}")
+        return False
 
     print(f"\n{user_interface.Style.DIM}Assistant is parsing details for new event based on: '{llm_suggestion_text}'...{user_interface.Style.RESET_ALL}")
 
-    parsed_event_details_from_llm = await llm_processor.parse_event_creation_details_from_suggestion(
+    current_event_creation_details = await llm_processor.parse_event_creation_details_from_suggestion(
         gemini_llm_model=gemini_llm_model,
         llm_suggestion_text=llm_suggestion_text,
         original_context_text=original_context_text,
@@ -506,48 +650,107 @@ async def handle_create_calendar_event(
         current_datetime_iso=current_time_for_llm_context
     )
 
-    if not parsed_event_details_from_llm or parsed_event_details_from_llm.get("error"):
-        error_msg = parsed_event_details_from_llm.get("error", "Failed to parse event creation details from LLM suggestion.") if parsed_event_details_from_llm else "LLM parsing for event creation returned None."
-        print(f"{user_interface.Fore.RED}Could not create event: {error_msg}{user_interface.Style.RESET_ALL}")
-        return False # Indicate failure to process this action
-
-    # Now, let the user confirm and potentially edit these parsed details
-    final_event_details_for_api = user_interface.get_event_creation_confirmation_and_edits(
-        parsed_event_details_from_llm # Pass the dictionary parsed by the LLM
-    )
-
-    if not final_event_details_for_api: # User cancelled in the UI
-        print(f"{user_interface.Fore.YELLOW}Event creation cancelled by user.{user_interface.Style.RESET_ALL}")
-        return True # Action was "handled" by user cancelling, not a script error
-
-    # Proceed to call the MCP tool to create the event
-    print(f"{user_interface.Style.DIM}Attempting to create calendar event: '{final_event_details_for_api.get('summary', 'Untitled Event')}'...{user_interface.Style.RESET_ALL}")
-
-    if not calendar_mcp_manager or not calendar_mcp_manager.session:
-        print(f"{user_interface.Fore.RED}Calendar MCP session not available. Cannot create event.{user_interface.Style.RESET_ALL}")
+    if not current_event_creation_details or current_event_creation_details.get("error"):
+        error_msg = current_event_creation_details.get("error", "Failed to parse event creation details.") if current_event_creation_details else "LLM parsing returned None."
+        print(f"{user_interface.Fore.RED}Could not proceed: {error_msg}{user_interface.Style.RESET_ALL}")
         return False
 
-    create_outcome = await calendar_mcp_manager.create_calendar_event(
-        event_details=final_event_details_for_api
-        # calendar_id defaults to "primary" in create_calendar_event method
-    )
+    while True:
+        final_event_details_for_api_or_trigger = user_interface.get_event_creation_confirmation_and_edits(
+            current_event_creation_details
+        )
 
-    if create_outcome.get("successful"):
-        created_event_response_data = create_outcome.get("created_event_data", {})
-        event_summary_created = created_event_response_data.get('summary', final_event_details_for_api.get('summary', 'Untitled Event'))
-        event_id_created = created_event_response_data.get('id', 'N/A')
-        print(f"{user_interface.Fore.GREEN}Success! {create_outcome.get('message', 'Event created.')} "
-              f"Title: '{event_summary_created}', ID: {event_id_created}{user_interface.Style.RESET_ALL}")
-        # PM: Consider if assistant should offer to add it to a local "just created" list for the current cycle display
-        return True
-    else:
-        error_msg = create_outcome.get('error', 'Failed to create event via MCP tool.')
-        print(f"{user_interface.Fore.RED}MCP Error creating event: {error_msg}{user_interface.Style.RESET_ALL}")
-        return False
+        if not final_event_details_for_api_or_trigger:
+            print(f"{user_interface.Fore.YELLOW}Event creation cancelled by user.{user_interface.Style.RESET_ALL}")
+            return True
 
+        if isinstance(final_event_details_for_api_or_trigger, dict) and \
+           final_event_details_for_api_or_trigger.get("trigger_action") == "find_free_slots":
+
+            print(f"\n{user_interface.Style.DIM}Finding free slots for the new event...{user_interface.Style.RESET_ALL}")
+            date_str = user_interface.get_user_input("Enter date (YYYY-MM-DD, 'today', 'tomorrow')", default="today")
+            duration_str = user_interface.get_user_input("Desired duration (e.g., 30m, 1h)",
+                default=f"{current_event_creation_details.get('event_duration_hour',0)}h{current_event_creation_details.get('event_duration_minutes',30)}m")
+
+            meeting_duration_minutes = 30
+            try:
+                if 'h' in duration_str:
+                    _h_part = duration_str.split('h')[0]
+                    _m_part = duration_str.split('h')[1].replace('m','') if len(duration_str.split('h')) > 1 else '0'
+                    meeting_duration_minutes = (int(_h_part) * 60) + (int(_m_part) if _m_part else 0)
+                elif 'm' in duration_str: meeting_duration_minutes = int(duration_str.replace('m',''))
+            except ValueError: meeting_duration_minutes = 30
+
+            target_date = None; now_ist = datetime.now(calendar_utils.IST)
+            if date_str.lower() == "today": target_date = now_ist.date()
+            elif date_str.lower() == "tomorrow": target_date = (now_ist + timedelta(days=1)).date()
+            else:
+                try: target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                except ValueError: print(f"{user_interface.Fore.RED}Invalid date format.{user_interface.Style.RESET_ALL}"); continue
+
+            if target_date:
+                time_min_dt = datetime(target_date.year, target_date.month, target_date.day, 9,0,0, tzinfo=calendar_utils.IST)
+                time_max_dt = datetime(target_date.year, target_date.month, target_date.day, 18,0,0, tzinfo=calendar_utils.IST)
+                time_min_iso = calendar_utils.format_datetime_to_iso_ist(time_min_dt)
+                time_max_iso = calendar_utils.format_datetime_to_iso_ist(time_max_dt)
+                parsed_target_date_str = target_date.strftime("%Y-%m-%d")
+
+                print(f"{user_interface.Style.DIM}Establishing session to find free slots...{user_interface.Style.RESET_ALL}")
+                async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-findslots-for-create") as slot_finder_manager:
+                    if slot_finder_manager.session:
+                        free_slots_result = await slot_finder_manager.get_calendar_free_slots(
+                            time_min_iso, time_max_iso, meeting_duration_minutes
+                        )
+                        if free_slots_result.get("successful"):
+                            slots_found = free_slots_result.get("free_slots", [])
+                            user_interface.display_free_slots(slots_found, parsed_target_date_str)
+                            if slots_found and user_interface.get_yes_no_input("Use one of these slots for the event?", default_yes=False):
+                                slot_choice_str = user_interface.get_user_input(f"Enter slot number (1-{len(slots_found)}) or 'n'")
+                                if slot_choice_str.isdigit():
+                                    slot_idx = int(slot_choice_str) - 1
+                                    if 0 <= slot_idx < len(slots_found):
+                                        chosen_slot_start_iso = slots_found[slot_idx]['start']
+                                        dt_obj = calendar_utils.parse_iso_to_ist(chosen_slot_start_iso)
+                                        if dt_obj:
+                                            current_event_creation_details["start_datetime"] = dt_obj.strftime("%Y-%m-%dT%H:%M:%S")
+                                            current_event_creation_details["timezone"] = "Asia/Kolkata"
+                                            current_event_creation_details["event_duration_hour"] = meeting_duration_minutes // 60
+                                            current_event_creation_details["event_duration_minutes"] = meeting_duration_minutes % 60
+                                            print(f"{user_interface.Fore.GREEN}Event time updated from slot.{user_interface.Style.RESET_ALL}")
+                        else: print(f"{user_interface.Fore.RED}Error finding slots: {free_slots_result.get('error')}{user_interface.Style.RESET_ALL}")
+                    else: print(f"{user_interface.Fore.RED}Could not connect to find slots.{user_interface.Style.RESET_ALL}")
+            continue # Go back to UI menu with potentially updated current_event_creation_details
+
+        final_event_details_for_api = final_event_details_for_api_or_trigger # This is when user chose 's'
+
+        print(f"{user_interface.Style.DIM}Establishing session to create calendar event...{user_interface.Style.RESET_ALL}")
+        async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-create-EXECUTE") as exec_cal_manager:
+            if not exec_cal_manager.session:
+                print(f"{user_interface.Fore.RED}Failed to establish session for event creation.{user_interface.Style.RESET_ALL}")
+                return False
+
+            create_outcome = await exec_cal_manager.create_calendar_event(event_details=final_event_details_for_api)
+
+        if create_outcome.get("successful"):
+            # ... (success message)
+            return True
+        else:
+            # ... (error message)
+            return False
+
+# assistant.py
+
+# ... (all your existing imports and helper function definitions:
+# run_signup_flow, perform_proactive_checks,
+# handle_draft_email_reply, handle_delete_calendar_event,
+# handle_update_calendar_event, handle_create_calendar_event
+# ensure these handler functions now get calendar_mcp_url and user_id from user_config internally
+# and open their own McpSessionManager when making the final MCP call, as per my last response.
+# ) ...
 
 async def main_assistant_entry():
     """Entry point for the assistant logic."""
+    # --- This initial part remains UNCHANGED ---
     if not config_manager.DEV_CONFIG.get(config_manager.ENV_GOOGLE_API_KEY):
         print(f"{user_interface.Fore.RED}Error: {config_manager.ENV_GOOGLE_API_KEY} is not set in .env file.{user_interface.Style.RESET_ALL}")
         sys.exit(f"Critical configuration missing: {config_manager.ENV_GOOGLE_API_KEY}")
@@ -574,32 +777,29 @@ async def main_assistant_entry():
         print(f"{user_interface.Fore.RED}Failed to initialize Gemini model: {e}{user_interface.Style.RESET_ALL}")
         traceback.print_exc()
         sys.exit("Could not initialize LLM. Exiting.")
+    # --- End of UNCHANGED initial part ---
 
-    # --- Outer loop for potentially multiple proactive check cycles ---
-    while True:
+    while True: # Outer loop for proactive checks
         can_continue, emails_to_display, events_to_display = await perform_proactive_checks(
             user_configuration, gemini_llm_model
         )
 
         if not can_continue:
             print(f"{user_interface.Fore.YELLOW}Exiting assistant due to required user action (e.g., authentication). Please re-run after completing the action.{user_interface.Style.RESET_ALL}")
-            break # Break outer assistant loop
+            break
 
-        if not emails_to_display and not any(e.get('suggested_actions') for e in events_to_display if e): # Check if events_to_display has actionable items
+        if not emails_to_display and not any(e.get('suggested_actions') for e in events_to_display if e):
             print(f"\n{user_interface.Fore.GREEN}No actionable items found in this cycle.{user_interface.Style.RESET_ALL}")
             if not user_interface.get_yes_no_input("Perform another full proactive check (y/N)?", default_yes=False):
                 print(f"{user_interface.Fore.YELLOW}Quitting assistant.{user_interface.Style.RESET_ALL}")
-                break # Quit outer assistant loop
+                break
             else:
-                continue # Go to next iteration of outer while True loop (re-check)
+                continue
 
-        # --- Inner loop for multiple actions on the CURRENTLY FETCHED items ---
         first_display_of_items = True
-        while True:
+        while True: # Inner loop for actions on current items
             action_choice_data = user_interface.display_processed_data_and_get_action(
-                emails_to_display,
-                events_to_display,
-                first_time_display=first_display_of_items
+                emails_to_display, events_to_display, first_time_display=first_display_of_items
             )
             first_display_of_items = False
 
@@ -612,20 +812,12 @@ async def main_assistant_entry():
 
             action_type, item_idx, action_idx_in_llm_suggestions, raw_choice = action_choice_data
 
-            if action_type == "done":
-                print(f"{user_interface.Fore.YELLOW}Done with actions for this set of items.{user_interface.Style.RESET_ALL}")
-                break
-            elif action_type == "quit_assistant":
-                print(f"{user_interface.Fore.YELLOW}Quitting assistant.{user_interface.Style.RESET_ALL}")
-                return
-            elif action_type == "redisplay":
-                first_display_of_items = True
-                continue
+            if action_type == "done": break
+            elif action_type == "quit_assistant": return
+            elif action_type == "redisplay": first_display_of_items = True; continue
 
             action_succeeded_this_turn = False
-            gmail_mcp_url = user_configuration.get(config_manager.GMAIL_MCP_URL_KEY)
-            calendar_mcp_url = user_configuration.get(config_manager.CALENDAR_MCP_URL_KEY)
-            user_id = user_configuration.get(config_manager.USER_EMAIL_KEY)
+            # Note: gmail_mcp_url, calendar_mcp_url, user_id are fetched inside handlers now if needed
 
             if action_type == "email":
                 chosen_email_data = emails_to_display[item_idx]
@@ -633,145 +825,92 @@ async def main_assistant_entry():
                 user_interface.print_header(f"Action on Email: {chosen_email_data['original_email_data'].get('subject', 'N/A')[:40]}...")
                 print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
 
+                # --- MODIFICATION FOR EMAIL ACTIONS ---
                 if "draft" in chosen_llm_action_text.lower() or \
                    "reply" in chosen_llm_action_text.lower() or \
-                   "confirm availability" in chosen_llm_action_text.lower() or \
-                   "suggest an alternative time" in chosen_llm_action_text.lower():
-                    if gmail_mcp_url and user_id:
-                        print(f"{user_interface.Style.DIM}Establishing Gmail session for action...{user_interface.Style.RESET_ALL}")
-                        async with McpSessionManager(gmail_mcp_url, user_id, "gmail-action") as action_gmail_manager: # Unique name for action manager
-                            if action_gmail_manager.session:
-                                action_succeeded_this_turn = await handle_draft_email_reply(
-                                    gemini_llm_model, chosen_email_data, chosen_llm_action_text,
-                                    user_configuration, action_gmail_manager
-                                )
-                            else:
-                                print(f"{user_interface.Fore.RED}Could not establish Gmail session for the action.{user_interface.Style.RESET_ALL}")
-                    else:
-                        print(f"{user_interface.Fore.RED}Gmail configuration (URL or User ID) missing.{user_interface.Style.RESET_ALL}")
+                   "availability" in chosen_llm_action_text.lower() or \
+                   "times" in chosen_llm_action_text.lower() or \
+                   "slots" in chosen_llm_action_text.lower() or \
+                   "propose" in chosen_llm_action_text.lower() or \
+                   "suggest" in chosen_llm_action_text.lower():
 
+                    action_succeeded_this_turn = await handle_draft_email_reply(
+                        gemini_llm_model,
+                        chosen_email_data,
+                        chosen_llm_action_text,
+                        user_configuration
+                        # No McpSessionManager passed here
+                    )
                 elif "create calendar event" in chosen_llm_action_text.lower() or \
-                    "schedule a meeting" in chosen_llm_action_text.lower() or \
-                    "add to calendar" in chosen_llm_action_text.lower(): # Keywords for creating event
+                     "schedule a meeting" in chosen_llm_action_text.lower() or \
+                     "add to calendar" in chosen_llm_action_text.lower():
 
                     original_email_body_for_context = chosen_email_data.get("original_email_data", {}).get("messageText") or \
-                                                    chosen_email_data.get("original_email_data", {}).get("snippet","No original email body available for context.")
-
-                    if calendar_mcp_url and user_id: # Ensure we have calendar config
-                        print(f"{user_interface.Style.DIM}Establishing Calendar session for create action (from email)...{user_interface.Style.RESET_ALL}")
-                        async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-create-from-email") as action_calendar_manager:
-                            if action_calendar_manager.session:
-                                action_succeeded_this_turn = await handle_create_calendar_event(
-                                    gemini_llm_model,
-                                    chosen_llm_action_text, # The LLM's suggestion string
-                                    original_email_body_for_context,
-                                    user_configuration,
-                                    action_calendar_manager
-                                )
-                            else:
-                                print(f"{user_interface.Fore.RED}Could not establish Calendar session for create action.{user_interface.Style.RESET_ALL}")
-                    else:
-                        print(f"{user_interface.Fore.RED}Calendar configuration missing. Cannot create event from email.{user_interface.Style.RESET_ALL}")
-
+                                                      chosen_email_data.get("original_email_data", {}).get("snippet","No original email body available for context.")
+                    action_succeeded_this_turn = await handle_create_calendar_event(
+                        gemini_llm_model,
+                        chosen_llm_action_text,
+                        original_email_body_for_context,
+                        user_configuration
+                        # No McpSessionManager passed here
+                    )
                 else:
-                    print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for email is not yet specifically implemented beyond drafting/replying.{user_interface.Style.RESET_ALL}")
+                    print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for email is not yet specifically implemented.{user_interface.Style.RESET_ALL}")
 
             elif action_type == "event":
-                # Ensure events_to_display has valid items before indexing
-                displayable_events = [e for e in events_to_display if e and e.get('suggested_actions')]
-                if 0 <= item_idx < len(displayable_events): # item_idx should be index for displayable_events list
-                    # This mapping was complex. Let's simplify by getting the actual event object
-                    # The item_idx from display_processed_data_and_get_action IS ALREADY the correct
-                    # index into the original processed_events_llm IF we ensure the numbering is based on it.
-                    # The user_interface function's event indexing logic needs to be robust.
-                    # For now, assuming item_idx directly maps to processed_events_llm (after emails).
+                if 0 <= item_idx < len(events_to_display):
+                    chosen_event_data = events_to_display[item_idx]
+                    chosen_llm_action_text = chosen_event_data['suggested_actions'][action_idx_in_llm_suggestions]
+                    original_event_summary_for_context = chosen_event_data.get("original_event_data", {}).get("summary", "related event")
+                    user_interface.print_header(f"Action on Event: {original_event_summary_for_context[:40]}...")
+                    print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
 
-                    # Find the true chosen event data from the original list passed to display_processed_data
-                    true_event_index_in_original_list = item_idx # if item_idx from UI is already 0-based for events_to_display
+                    # --- MODIFICATION FOR CALENDAR ACTIONS ---
+                    if "update this event's details" in chosen_llm_action_text.lower() or \
+                       "reschedule" in chosen_llm_action_text.lower() or \
+                       "change title" in chosen_llm_action_text.lower() or \
+                       "add attendee" in chosen_llm_action_text.lower() or \
+                       "add google meet" in chosen_llm_action_text.lower():
 
-                    if 0 <= true_event_index_in_original_list < len(events_to_display):
-                        chosen_event_data = events_to_display[true_event_index_in_original_list]
-                        chosen_llm_action_text = chosen_event_data['suggested_actions'][action_idx_in_llm_suggestions]
-                        user_interface.print_header(f"Action on Event: {chosen_event_data['original_event_data'].get('summary', 'N/A')[:40]}...")
-                        print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
+                        action_succeeded_this_turn = await handle_update_calendar_event(
+                            chosen_event_data,
+                            user_configuration
+                            # No McpSessionManager passed here
+                        )
+                    elif "delete" in chosen_llm_action_text.lower() or "cancel this meeting" in chosen_llm_action_text.lower():
+                        action_succeeded_this_turn = await handle_delete_calendar_event(
+                            chosen_event_data,
+                            user_configuration
+                            # No McpSessionManager passed here
+                        )
+                    elif "create a new event" in chosen_llm_action_text.lower() or \
+                         "schedule a follow-up" in chosen_llm_action_text.lower() or \
+                         "schedule a prep session" in chosen_llm_action_text.lower() or \
+                         "block additional time" in chosen_llm_action_text.lower():
 
-                        if "update this event's details" in chosen_llm_action_text.lower() or \
-                                           "reschedule" in chosen_llm_action_text.lower() or \
-                                           "change title" in chosen_llm_action_text.lower() or \
-                                           "add attendee" in chosen_llm_action_text.lower() or \
-                                           "add google meet" in chosen_llm_action_text.lower(): # Add more keywords
-
-                                            if calendar_mcp_url and user_id:
-                                                print(f"{user_interface.Style.DIM}Establishing Calendar session for update action...{user_interface.Style.RESET_ALL}")
-                                                async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-update") as action_calendar_manager:
-                                                    if action_calendar_manager.session:
-                                                        action_succeeded_this_turn = await handle_update_calendar_event(
-                                                            chosen_event_data,
-                                                            user_configuration,
-                                                            action_calendar_manager
-                                                        )
-
-                        elif "delete" in chosen_llm_action_text.lower() or "cancel this meeting" in chosen_llm_action_text.lower():
-                            if calendar_mcp_url and user_id:
-                                print(f"{user_interface.Style.DIM}Establishing Calendar session for delete action...{user_interface.Style.RESET_ALL}")
-                                async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-delete") as action_calendar_manager: # Unique name
-                                    if action_calendar_manager.session:
-                                        action_succeeded_this_turn = await handle_delete_calendar_event(
-                                            chosen_event_data, user_configuration, action_calendar_manager
-                                        )
-                                    else:
-                                        print(f"{user_interface.Fore.RED}Could not establish Calendar session for delete action.{user_interface.Style.RESET_ALL}")
-                            else:
-                                print(f"{user_interface.Fore.RED}Calendar config missing. Cannot delete event.{user_interface.Style.RESET_ALL}")
-                        elif "create a new event" in chosen_llm_action_text.lower() or \
-                             "schedule a follow-up" in chosen_llm_action_text.lower() or \
-                             "schedule a prep session" in chosen_llm_action_text.lower() or \
-                             "block additional time" in chosen_llm_action_text.lower():
-
-                            # Define original_event_summary_for_context HERE
-                            original_event_summary_for_context = chosen_event_data.get("original_event_data", {}).get("summary", "related event") # Get summary of the CURRENT event
-
-                            if calendar_mcp_url and user_id:
-                                print(f"{user_interface.Style.DIM}Establishing Calendar session for create action (from event context)...{user_interface.Style.RESET_ALL}")
-                                async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-create-from-event") as action_calendar_manager:
-                                    if action_calendar_manager.session:
-                                        action_succeeded_this_turn = await handle_create_calendar_event(
-                                            gemini_llm_model,
-                                            chosen_llm_action_text,
-                                            original_event_summary_for_context, # Now it's defined
-                                            user_configuration,
-                                            action_calendar_manager
-                                        )
-                                    else:
-                                        print(f"{user_interface.Fore.RED}Could not establish Calendar session for create action.{user_interface.Style.RESET_ALL}")
-                            else:
-                                 print(f"{user_interface.Fore.RED}Calendar configuration missing. Cannot create new event.{user_interface.Style.RESET_ALL}")
-                        else:
-                            print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for event is not yet implemented.{user_interface.Style.RESET_ALL}")
+                        action_succeeded_this_turn = await handle_create_calendar_event(
+                            gemini_llm_model,
+                            chosen_llm_action_text,
+                            original_event_summary_for_context,
+                            user_configuration
+                            # No McpSessionManager passed here
+                        )
                     else:
-                        print(f"{user_interface.Fore.RED}Internal error: Invalid event index after selection.{user_interface.Style.RESET_ALL}")
+                        print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for event (ID: {chosen_event_data.get('original_event_data', {}).get('id')}) is not yet implemented.{user_interface.Style.RESET_ALL}")
                 else:
-                    print(f"{user_interface.Fore.RED}Internal error: Invalid event index from UI choice.{user_interface.Style.RESET_ALL}")
-
+                    print(f"{user_interface.Fore.RED}Internal error: Invalid event index selected ({item_idx}).{user_interface.Style.RESET_ALL}")
 
             if action_succeeded_this_turn:
-                print(f"{user_interface.Fore.GREEN}Action '{raw_choice}' processed successfully.{user_interface.Style.RESET_ALL}")
-                # PM: After a successful action, data might be stale.
-                # Forcing a redisplay of current (potentially stale) data. User can use 'r' for full refresh.
-                print(f"{user_interface.Style.DIM}Displaying current items. Use 'r' to fetch fresh data if needed.{user_interface.Style.RESET_ALL}")
-                # We don't set first_display_of_items = True here, so it just re-prompts for action on current data.
-            elif action_type in ["email", "event"]: # If it was an email/event action but it failed or wasn't handled
+                print(f"{user_interface.Fore.GREEN}Action '{raw_choice}' processed.{user_interface.Style.RESET_ALL}")
+                print(f"{user_interface.Style.DIM}The displayed list might be stale. Use 'r' to refresh if needed.{user_interface.Style.RESET_ALL}")
+            elif action_type in ["email", "event"]:
                 print(f"{user_interface.Fore.YELLOW}Action '{raw_choice}' was not fully completed or not applicable.{user_interface.Style.RESET_ALL}")
 
-            # Loop back to display_processed_data_and_get_action for another action on the same set of items
-
-        # This is the end of the inner "action loop" for the current set of fetched items
         print(f"\n{user_interface.Style.DIM}Finished interacting with current set of proactive items.{user_interface.Style.RESET_ALL}")
 
         if not user_interface.get_yes_no_input("Perform another full proactive check (y/N)?", default_yes=False):
             print(f"{user_interface.Fore.YELLOW}Quitting assistant.{user_interface.Style.RESET_ALL}")
-            break # Break outer assistant loop (for multiple checks)
-        # else: continue to the next proactive check (next iteration of outer while True)
+            break
 
     print(f"\n{user_interface.Style.DIM}Proactive Assistant session finished.{user_interface.Style.RESET_ALL}")
 
@@ -780,7 +919,7 @@ if __name__ == "__main__":
         asyncio.run(main_assistant_entry())
     except KeyboardInterrupt:
         print(f"\n{user_interface.Fore.YELLOW}Assistant stopped by user. Goodbye!{user_interface.Style.RESET_ALL}")
-    except SystemExit as e:
+    except SystemExit:
         pass
     except Exception as e:
         print(f"{user_interface.Fore.RED}An unexpected error occurred in the main execution: {e}{user_interface.Style.RESET_ALL}")
