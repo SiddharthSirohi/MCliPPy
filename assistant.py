@@ -723,8 +723,29 @@ async def main_assistant_entry():
                                         print(f"{user_interface.Fore.RED}Could not establish Calendar session for delete action.{user_interface.Style.RESET_ALL}")
                             else:
                                 print(f"{user_interface.Fore.RED}Calendar config missing. Cannot delete event.{user_interface.Style.RESET_ALL}")
-                        # elif "create event" in chosen_llm_action_text.lower(): # TODO
-                        #     pass
+                        elif "create a new event" in chosen_llm_action_text.lower() or \
+                             "schedule a follow-up" in chosen_llm_action_text.lower() or \
+                             "schedule a prep session" in chosen_llm_action_text.lower() or \
+                             "block additional time" in chosen_llm_action_text.lower():
+
+                            # Define original_event_summary_for_context HERE
+                            original_event_summary_for_context = chosen_event_data.get("original_event_data", {}).get("summary", "related event") # Get summary of the CURRENT event
+
+                            if calendar_mcp_url and user_id:
+                                print(f"{user_interface.Style.DIM}Establishing Calendar session for create action (from event context)...{user_interface.Style.RESET_ALL}")
+                                async with McpSessionManager(calendar_mcp_url, user_id, "googlecalendar-action-create-from-event") as action_calendar_manager:
+                                    if action_calendar_manager.session:
+                                        action_succeeded_this_turn = await handle_create_calendar_event(
+                                            gemini_llm_model,
+                                            chosen_llm_action_text,
+                                            original_event_summary_for_context, # Now it's defined
+                                            user_configuration,
+                                            action_calendar_manager
+                                        )
+                                    else:
+                                        print(f"{user_interface.Fore.RED}Could not establish Calendar session for create action.{user_interface.Style.RESET_ALL}")
+                            else:
+                                 print(f"{user_interface.Fore.RED}Calendar configuration missing. Cannot create new event.{user_interface.Style.RESET_ALL}")
                         else:
                             print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for event is not yet implemented.{user_interface.Style.RESET_ALL}")
                     else:
