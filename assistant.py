@@ -261,17 +261,19 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
         return False, important_emails_llm_data, raw_calendar_events
 
     # --- Process Calendar with LLM ---
-    processed_events_llm_data = []
+    actionable_events_llm_data = [] # New list for only actionable events
     if raw_calendar_events and user_config.get(config_manager.NOTIFICATION_PREFS_KEY, {}).get("calendar", "off") != "off":
-        # user_interface.print_header(f"Processing {len(raw_calendar_events)} Calendar events with LLM")
-        processed_events_llm_data = await llm_processor.process_calendar_events_with_llm(
+        processed_events_from_llm_temp = await llm_processor.process_calendar_events_with_llm(
             gemini_llm_model, raw_calendar_events, user_persona, user_priorities, user_config
         )
-        # print(f"LLM processed {len(processed_events_llm_data)} calendar event(s).")
+        if processed_events_from_llm_temp:
+            for pe_data in processed_events_from_llm_temp:
+                if pe_data.get('suggested_actions'): # Only include if LLM gave actions
+                    actionable_events_llm_data.append(pe_data)
 
     # --- Send Notifications ---
     num_imp_emails = len(important_emails_llm_data)
-    num_act_events = len([e for e in processed_events_llm_data if e.get('suggested_actions')]) # Count events that LLM gave actions for
+    num_act_events = len(actionable_events_llm_data) # Use this for notification
 
     if user_config.get(config_manager.NOTIFICATION_PREFS_KEY, {}).get("email", "off") != "off" or \
        user_config.get(config_manager.NOTIFICATION_PREFS_KEY, {}).get("calendar", "off") != "off":
@@ -293,7 +295,7 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
 
 
     print(f"{user_interface.Style.DIM}Proactive checks cycle complete.{user_interface.Style.RESET_ALL}")
-    return True, important_emails_llm_data, processed_events_llm_data
+    return True, important_emails_llm_data, actionable_events_llm_data # Return the filtered list
 
 
 async def handle_draft_email_reply(
@@ -779,32 +781,32 @@ async def main_assistant_entry():
         sys.exit("Could not initialize LLM. Exiting.")
     # --- End of UNCHANGED initial part ---
 
-    while True: # Outer loop for proactive checks
-        can_continue, emails_to_display, events_to_display = await perform_proactive_checks(
+    while True: # Outer loop
+        can_continue, actionable_emails_list, actionable_events_list = await perform_proactive_checks(
             user_configuration, gemini_llm_model
-        )
+        ) # Renamed for clarity
 
-        if not can_continue:
-            print(f"{user_interface.Fore.YELLOW}Exiting assistant due to required user action (e.g., authentication). Please re-run after completing the action.{user_interface.Style.RESET_ALL}")
-            break
+        if not can_continue: break # Auth needed
 
-        if not emails_to_display and not any(e.get('suggested_actions') for e in events_to_display if e):
-            print(f"\n{user_interface.Fore.GREEN}No actionable items found in this cycle.{user_interface.Style.RESET_ALL}")
+        # Check if the FILTERED lists are empty
+        if not actionable_emails_list and not actionable_events_list:
+            print(f"\n{user_interface.Fore.GREEN}No items with actionable suggestions found in this cycle.{user_interface.Style.RESET_ALL}")
             if not user_interface.get_yes_no_input("Perform another full proactive check (y/N)?", default_yes=False):
-                print(f"{user_interface.Fore.YELLOW}Quitting assistant.{user_interface.Style.RESET_ALL}")
                 break
             else:
                 continue
 
         first_display_of_items = True
-        while True: # Inner loop for actions on current items
+        while True: # Inner action loop
             action_choice_data = user_interface.display_processed_data_and_get_action(
-                emails_to_display, events_to_display, first_time_display=first_display_of_items
+                actionable_emails_list, # Pass filtered lists
+                actionable_events_list,
+                first_time_display=first_display_of_items
             )
             first_display_of_items = False
 
             if not action_choice_data:
-                if not emails_to_display and not any(e.get('suggested_actions') for e in events_to_display if e):
+                if not actionable_emails_list and not any(e.get('suggested_actions') for e in actionable_events_list if e):
                     break
                 else:
                     print(f"{user_interface.Fore.YELLOW}Please try your selection again or choose 'd' (done), 'r' (redisplay), or 'q' (quit).{user_interface.Style.RESET_ALL}")
@@ -820,7 +822,7 @@ async def main_assistant_entry():
             # Note: gmail_mcp_url, calendar_mcp_url, user_id are fetched inside handlers now if needed
 
             if action_type == "email":
-                chosen_email_data = emails_to_display[item_idx]
+                chosen_email_data = actionable_emails_list[item_idx]
                 chosen_llm_action_text = chosen_email_data['suggested_actions'][action_idx_in_llm_suggestions]
                 user_interface.print_header(f"Action on Email: {chosen_email_data['original_email_data'].get('subject', 'N/A')[:40]}...")
                 print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
@@ -858,8 +860,8 @@ async def main_assistant_entry():
                     print(f"{user_interface.Fore.MAGENTA}Action '{chosen_llm_action_text}' for email is not yet specifically implemented.{user_interface.Style.RESET_ALL}")
 
             elif action_type == "event":
-                if 0 <= item_idx < len(events_to_display):
-                    chosen_event_data = events_to_display[item_idx]
+                if 0 <= item_idx < len(actionable_events_list): # Redundant check if UI is correct, but safe
+                    chosen_event_data = actionable_events_list[item_idx]
                     chosen_llm_action_text = chosen_event_data['suggested_actions'][action_idx_in_llm_suggestions]
                     original_event_summary_for_context = chosen_event_data.get("original_event_data", {}).get("summary", "related event")
                     user_interface.print_header(f"Action on Event: {original_event_summary_for_context[:40]}...")

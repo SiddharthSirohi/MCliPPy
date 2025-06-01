@@ -229,7 +229,7 @@ class McpSessionManager:
             if text_content:
                 try:
                     composio_response = json.loads(text_content)
-                    print(f"DEBUG_MCP_HANDLER (FindFreeSlots): Parsed composio_response: {json.dumps(composio_response, indent=2)}")
+                    print(f"DEBUG_MCP_HANDLER (FindFreeSlots): Composio_response received.")
 
                     if composio_response.get("successful") is True:
                         response_data = composio_response.get("data", {}).get("response_data", {})

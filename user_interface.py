@@ -130,43 +130,35 @@ def display_calendar_event_summary(index: int, event_data: Dict[str, Any]):
 
 # user_interface.py
 def display_processed_data_and_get_action(
-    important_emails_llm: List[Dict[str, Any]],
-    processed_events_llm: List[Dict[str, Any]],
-    first_time_display: bool = True # New parameter
-) -> Optional[Tuple[str, int, int, str]]: # type, item_idx, action_idx, raw_user_choice
-    """
-    Displays summarized emails and events, then prompts for action.
-    Returns:
-        - ("email", email_idx, action_idx, raw_choice)
-        - ("event", event_idx, action_idx, raw_choice)
-        - ("done", -1, -1, "d") if user wants to finish with this set of items
-        - ("quit_assistant", -1, -1, "q") if user wants to quit the whole assistant
-        - None if no actionable items or invalid input format after trying
-    """
-    actionable_items_present = False
-    if first_time_display: # Only print headers and full lists the first time in a cycle
-        if important_emails_llm:
+    # Parameters now represent already filtered actionable items
+    actionable_emails: List[Dict[str, Any]],
+    actionable_events: List[Dict[str, Any]],
+    first_time_display: bool = True
+) -> Optional[Tuple[str, int, int, str]]:
+
+    actionable_items_present_in_call = False # Check if anything was passed
+    if first_time_display:
+        if actionable_emails:
             print_header("Important Emails")
-            for i, email_data in enumerate(important_emails_llm):
-                display_email_summary(i + 1, email_data)
-            actionable_items_present = True
+            for i, email_data in enumerate(actionable_emails):
+                display_email_summary(i + 1, email_data) # display_email_summary already checks for suggested_actions
+            actionable_items_present_in_call = True
         else:
             print(f"{Fore.GREEN}No new important emails requiring immediate attention.{Style.RESET_ALL}")
 
-        if processed_events_llm:
-            print_header("Upcoming Calendar Events")
-            for i, event_data in enumerate(processed_events_llm):
-                if event_data.get('suggested_actions'):
-                    display_calendar_event_summary(len(important_emails_llm) + i + 1, event_data)
-                    actionable_items_present = True
+        if actionable_events: # This list now ONLY contains events with actions
+            print_header("Upcoming Calendar Events with Actions")
+            for i, event_data in enumerate(actionable_events):
+                # No need for 'if event_data.get('suggested_actions'):' here anymore
+                display_calendar_event_summary(len(actionable_emails) + i + 1, event_data)
+            actionable_items_present_in_call = True
         else:
             print(f"{Fore.GREEN}No upcoming events with specific suggestions.{Style.RESET_ALL}")
 
-        if not actionable_items_present:
-            print(f"\n{Fore.GREEN}All caught up for now!{Style.RESET_ALL}")
-            return None
-    elif not important_emails_llm and not any(e.get('suggested_actions') for e in processed_events_llm):
-        # If, after an action, there are no more items (e.g., last item was deleted)
+        if not actionable_items_present_in_call:
+            print(f"\n{Fore.GREEN}All caught up! No items requiring immediate action choices.{Style.RESET_ALL}")
+            return ("done", -1, -1, "d") # Effectively "done" as there's nothing to choose from
+    elif not actionable_emails and not actionable_events: # If lists became empty after an action
         print(f"\n{Fore.GREEN}No more actionable items in this cycle.{Style.RESET_ALL}")
         return ("done", -1, -1, "d")
 
@@ -191,55 +183,28 @@ def display_processed_data_and_get_action(
         action_char_chosen = user_choice_str[-1]
         action_idx_chosen = ord(action_char_chosen) - ord('a')
 
-        if 1 <= item_num_chosen <= len(important_emails_llm):
+        if 1 <= item_num_chosen <= len(actionable_emails):
             item_type = "email"
-            actual_item_idx = item_num_chosen - 1
-            if 0 <= action_idx_chosen < len(important_emails_llm[actual_item_idx].get('suggested_actions', [])):
+            actual_item_idx = item_num_chosen - 1 # This is now a direct index into actionable_emails
+            if 0 <= action_idx_chosen < len(actionable_emails[actual_item_idx].get('suggested_actions', [])):
                 return item_type, actual_item_idx, action_idx_chosen, user_choice_str
             else:
                 print(f"{Fore.RED}Invalid action '{action_char_chosen}' for email {item_num_chosen}.{Style.RESET_ALL}")
-        # ... (event logic for choosing action, same as before, ensure it also returns user_choice_str)
-        elif len(important_emails_llm) < item_num_chosen <= (len(important_emails_llm) + len(processed_events_llm)):
-            # Adjusting to correctly index into processed_events_llm which might have non-actionable items filtered out by display
-            # This needs care: the numbering presented to user must map back correctly.
-            # For simplicity, let's assume processed_events_llm only contains actionable events for display indexing.
-            # This part needs careful alignment with how events are numbered and stored if some are filtered from display.
-            # For now, assuming display_calendar_event_summary was called for all in processed_events_llm that had actions.
 
-            # Let's filter processed_events_llm to only those that were displayed (had actions)
-            displayable_events = [e for e in processed_events_llm if e.get('suggested_actions')]
-
-            if len(important_emails_llm) < item_num_chosen <= (len(important_emails_llm) + len(displayable_events)):
-                item_type = "event"
-                # User's item_num_chosen is 1-based and global.
-                # actual_item_idx is 0-based for the displayable_events list.
-                actual_item_idx_in_displayable = item_num_chosen - 1 - len(important_emails_llm)
-
-                if 0 <= actual_item_idx_in_displayable < len(displayable_events):
-                    # We need to find this event in the original processed_events_llm list to get its original index
-                    # This is tricky if items were filtered. A safer way is to pass back the actual item or its original index.
-                    # For now, let's assume a direct mapping for simplicity, will need refinement if filtering display.
-                    # Simpler: find the original event data corresponding to this displayable event
-                    chosen_displayable_event = displayable_events[actual_item_idx_in_displayable]
-                    original_event_idx = -1
-                    for idx, orig_event in enumerate(processed_events_llm):
-                        # Assuming event IDs are unique and present from LLM
-                        if orig_event.get("original_event_data",{}).get("id") == chosen_displayable_event.get("original_event_data",{}).get("id"):
-                            original_event_idx = idx
-                            break
-
-                    if original_event_idx != -1 and 0 <= action_idx_chosen < len(chosen_displayable_event.get('suggested_actions', [])):
-                         return item_type, original_event_idx, action_idx_chosen, user_choice_str # Return original_event_idx
-                    else:
-                        print(f"{Fore.RED}Invalid action '{action_char_chosen}' for event {item_num_chosen} or event ID mismatch.{Style.RESET_ALL}")
-                else:
-                    print(f"{Fore.RED}Invalid selection for event {item_num_chosen}.{Style.RESET_ALL}")
+        elif len(actionable_emails) < item_num_chosen <= (len(actionable_emails) + len(actionable_events)):
+            item_type = "event"
+            # actual_item_idx is now a direct index into actionable_events
+            actual_item_idx = item_num_chosen - 1 - len(actionable_emails)
+            if 0 <= actual_item_idx < len(actionable_events) and \
+               0 <= action_idx_chosen < len(actionable_events[actual_item_idx].get('suggested_actions', [])):
+                return item_type, actual_item_idx, action_idx_chosen, user_choice_str
             else:
-                print(f"{Fore.RED}Invalid item number '{item_num_chosen}'.{Style.RESET_ALL}")
+                print(f"{Fore.RED}Invalid action '{action_char_chosen}' for event {item_num_chosen}.{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.RED}Invalid item number '{item_num_chosen}'.{Style.RESET_ALL}")
     else:
         if user_choice_str:
             print(f"{Fore.RED}Invalid input format. Use item number then action letter (e.g., '1a').{Style.RESET_ALL}")
-
     return None # Invalid input or no action
 
 def get_send_edit_cancel_confirmation(draft_text: str, service_name: str = "email") -> str:
