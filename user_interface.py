@@ -258,7 +258,7 @@ def get_event_update_choices(original_event_summary: str, original_event_details
         "3": {"name": "Duration (Hours, Minutes)", "key": "duration", "type": "duration"},
         "4": {"name": "Description", "key": "description", "type": "str"},
         "5": {"name": "Location", "key": "location", "type": "str"},
-        "6": {"name": "Attendees (comma-separated emails)", "key": "attendees", "type": "email_list"},
+        "6": {"name": "Attendees (comma-separated emails)", "key": "attendees", "type": "email_list_str"},
         "7": {"name": "Google Meet Link (Add/Ensure)", "key": "create_meeting_room", "type": "bool_true"},
         "f": {"name": "Find & Display Free Slots", "key": "find_free_slots_trigger", "type": "action_trigger"}
     }
@@ -387,14 +387,8 @@ def get_event_update_choices(original_event_summary: str, original_event_details
                         print(f"{Fore.RED}Invalid duration values.{Style.RESET_ALL}")
                 except ValueError:
                     print(f"{Fore.RED}Duration must be numbers.{Style.RESET_ALL}")
-            elif field_type == "email_list_str": # Matching my type for attendees as list of strings
-                current_attendees_str = ", ".join(updates.get(field_key, []))
-                emails_str = get_user_input(f"Enter new {field_info['name']} (comma-separated emails)", default=current_attendees_str)
-                attendee_email_strings = [e.strip() for e in emails_str.split(',') if e.strip() and "@" in e]
-                updates[field_key] = attendee_email_strings
-                print(f"   (DEBUG: Attendees to be sent as list of strings: {updates[field_key]})")
-            elif field_type == "email_list_str": # Matching my type for attendees as list of strings
-                current_attendees_str = ", ".join(updates.get(field_key, []))
+            elif field_type == "email_list_str": # Or "email_list" if that's what you have
+                current_attendees_str = ", ".join(updates.get(field_key, [])) # Assumes updates[field_key] is list of strings
                 emails_str = get_user_input(f"Enter new {field_info['name']} (comma-separated emails)", default=current_attendees_str)
                 attendee_email_strings = [e.strip() for e in emails_str.split(',') if e.strip() and "@" in e]
                 updates[field_key] = attendee_email_strings

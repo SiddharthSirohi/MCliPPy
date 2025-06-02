@@ -30,7 +30,7 @@ def calculate_free_slots(
     Returns a list of dicts, each like {"start": "iso_start_str_ist", "end": "iso_end_str_ist"}
     """
     free_slots_found = []
-    
+
     # Convert busy_slots_data to datetime objects and sort
     parsed_busy_slots = []
     for busy in busy_slots_data:
@@ -38,7 +38,7 @@ def calculate_free_slots(
         end = parse_iso_to_ist(busy.get("end"))
         if start and end and start < end: # Basic validation
             parsed_busy_slots.append({"start": start, "end": end})
-    
+
     parsed_busy_slots.sort(key=lambda x: x["start"])
 
     # Effective start of the day for slot finding (max of query start or workday start for that day)
@@ -47,7 +47,7 @@ def calculate_free_slots(
 
     # Effective end of the day for slot finding (min of query end or workday end for that day)
     day_work_end_dt = query_end_dt_ist.replace(hour=workday_end_hour, minute=0, second=0, microsecond=0)
-    
+
     # Merge overlapping/adjacent busy slots (optional but good for cleaner logic)
     # For simplicity, let's skip merging for now and handle overlaps in the loop.
     # A more robust solution would merge overlapping busy intervals first.
@@ -86,7 +86,7 @@ def calculate_free_slots(
         # Ensure slot is within the workday boundaries of its own day
         slot_workday_start = current_slot_start.replace(hour=workday_start_hour, minute=0, second=0, microsecond=0)
         slot_workday_end = current_slot_start.replace(hour=workday_end_hour, minute=0, second=0, microsecond=0)
-        
+
         if current_slot_start >= slot_workday_start and slot_end_candidate <= slot_workday_end:
             free_slots_found.append({
                 "start": format_datetime_to_iso_ist(current_slot_start),
@@ -99,11 +99,11 @@ def calculate_free_slots(
 if __name__ == '__main__':
     # Test the calculate_free_slots function
     print("--- Testing Calendar Utils ---")
-    
+
     # Example from your log for 2025-06-02, IST
     test_query_start_str = "2025-06-02T09:00:00+05:30"
     test_query_end_str = "2025-06-02T18:00:00+05:30"
-    
+
     # Busy slots from your example response (ensure they are for the query day)
     test_busy_slots = [
         {"start": "2025-06-02T09:00:00+05:30", "end": "2025-06-02T10:30:00+05:30"}, # Study ConSys + Deep Dive
@@ -114,7 +114,7 @@ if __name__ == '__main__':
 
     query_start_dt = parse_iso_to_ist(test_query_start_str)
     query_end_dt = parse_iso_to_ist(test_query_end_str)
-    
+
     if query_start_dt and query_end_dt:
         print(f"\nFinding 30-minute slots for {query_start_dt.date()} between 9 AM and 6 PM IST")
         slots_30min = calculate_free_slots(query_start_dt, query_end_dt, test_busy_slots, 30)
@@ -125,7 +125,7 @@ if __name__ == '__main__':
         slots_60min = calculate_free_slots(query_start_dt, query_end_dt, test_busy_slots, 60)
         for slot in slots_60min:
             print(f"  Free: {slot['start']} to {slot['end']}")
-        
+
         print(f"\nFinding 15-minute slots for {query_start_dt.date()} between 9 AM and 6 PM IST")
         slots_15min = calculate_free_slots(query_start_dt, query_end_dt, test_busy_slots, 15)
         for slot in slots_15min:

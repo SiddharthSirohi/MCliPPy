@@ -176,6 +176,8 @@ class McpSessionManager:
         time_min_iso_ist: str,    # e.g., "2025-06-02T09:00:00+05:30"
         time_max_iso_ist: str,    # e.g., "2025-06-02T18:00:00+05:30"
         meeting_duration_minutes: int,
+        user_work_start_hour: int,
+        user_work_end_hour: int,
         calendar_id: str = "primary"
     ) -> Dict[str, Any]:
         """
@@ -247,8 +249,9 @@ class McpSessionManager:
                             query_start_dt_ist=query_start_dt,
                             query_end_dt_ist=query_end_dt,
                             busy_slots_data=busy_slots_for_calendar,
-                            meeting_duration_minutes=meeting_duration_minutes
-                            # workday_start_hour and workday_end_hour use defaults from calendar_utils
+                            meeting_duration_minutes=meeting_duration_minutes,
+                            workday_start_hour=user_work_start_hour,
+                            workday_end_hour=user_work_end_hour                            # workday_start_hour and workday_end_hour use defaults from calendar_utils
                         )
                         print(f"{user_interface.Fore.GREEN}Successfully found {len(free_slots)} free slot(s).{user_interface.Style.RESET_ALL}")
                         return {"successful": True, "free_slots": free_slots}
