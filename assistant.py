@@ -3,6 +3,8 @@ import sys
 import json
 import asyncio
 import traceback
+import platform
+import argparse
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
@@ -19,6 +21,77 @@ import calendar_utils
 
 # --- Helper for User Input & Signup Flow (from user_interface.py now) ---
 # These are called from user_interface.py, so no need to redefine here.
+
+# assistant.py
+def generate_launchd_plist_content(
+    script_path: str,
+    working_directory: str,
+    label_prefix: str,
+    frequency_minutes: int,
+    log_dir: str
+) -> str:
+    print(f"DEBUG_PLIST_GEN (Start of function): Received working_directory: {working_directory}")
+    project_root = Path(working_directory).resolve()
+    print(f"DEBUG_PLIST_GEN: Resolved project_root: {project_root}")
+
+    venv_python_path = project_root / ".venv" / "bin" / "python"
+    print(f"DEBUG_PLIST_GEN: Expected venv_python_path: {venv_python_path}")
+
+
+    # Determine which python executable to use
+    path_exists_check = venv_python_path.exists() # Store the result of exists()
+    print(f"DEBUG_PLIST_GEN: Result of venv_python_path.exists(): {path_exists_check}") # DEBUG
+
+    if path_exists_check: # Use the stored result
+        print(f"{user_interface.Fore.GREEN}DEBUG_PLIST_GEN: venv_python_path EXISTS branch taken.{user_interface.Style.RESET_ALL}")
+        python_exec_to_use_candidate = str(venv_python_path)
+        print(f"DEBUG_PLIST_GEN: Candidate from venv: {python_exec_to_use_candidate}")
+        python_exec_to_use = python_exec_to_use_candidate # Direct assignment
+    else:
+        print(f"{user_interface.Fore.RED}DEBUG_PLIST_GEN: venv_python_path DOES NOT EXIST branch taken.{user_interface.Style.RESET_ALL}")
+        current_sys_executable = str(Path(sys.executable).resolve())
+        print(f"{user_interface.Fore.YELLOW}WARNING: Virtual environment Python not found. Falling back to sys.executable: {current_sys_executable}{user_interface.Style.RESET_ALL}")
+        python_exec_to_use = current_sys_executable
+
+    print(f"DEBUG_PLIST_GEN: VALUE OF 'python_exec_to_use' AFTER IF/ELSE: {python_exec_to_use}") # Renamed for clarity
+
+    # **** ADD THIS FINAL OVERRIDE FOR DEBUGGING ****
+    # **** If the above still fails, this will force it for the plist string ****
+    # python_exec_to_use = str(venv_python_path.resolve())
+    # print(f"DEBUG_PLIST_GEN: FORCED VALUE of 'python_exec_to_use' FOR PLIST: {python_exec_to_use}")
+    # **** END OF DEBUGGING OVERRIDE ****
+
+    script_path_resolved = str(Path(script_path).resolve())
+    log_dir_resolved = str(Path(log_dir).resolve())
+    Path(log_dir_resolved).mkdir(parents=True, exist_ok=True)
+    label = f"{label_prefix}.proactiveassistant"
+    interval_seconds = int(frequency_minutes * 60)
+
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python_exec_to_use}</string>
+        <string>{script_path_resolved}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{str(project_root)}</string>
+    <key>StartInterval</key>
+    <integer>{interval_seconds}</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log_dir_resolved}/assistant_out.log</string>
+    <key>StandardErrorPath</key>
+    <string>{log_dir_resolved}/assistant_err.log</string>
+</dict>
+</plist>
+"""
+    return plist_content
 
 def run_signup_flow(): # Stays in assistant.py as it uses config_manager directly
     print(f"{user_interface.Fore.CYAN}Welcome to your Proactive AI Assistant!{user_interface.Style.RESET_ALL}")
@@ -126,7 +199,6 @@ def run_signup_flow(): # Stays in assistant.py as it uses config_manager directl
     # --- END OF SCHEDULING AND WORKING HOURS PROMPTS ---
 
 
-
     gmail_server_uuid = config_manager.DEV_CONFIG.get(config_manager.ENV_GMAIL_MCP_SERVER_UUID)
     calendar_server_uuid = config_manager.DEV_CONFIG.get(config_manager.ENV_CALENDAR_MCP_SERVER_UUID)
 
@@ -143,12 +215,59 @@ def run_signup_flow(): # Stays in assistant.py as it uses config_manager directl
     user_config[config_manager.LAST_EMAIL_CHECK_KEY] = datetime.now(timezone.utc).isoformat()
 
     if config_manager.save_user_config(user_config):
-        user_interface.print_header("Setup Complete")
+        user_interface.print_header("Setup Complete & launchd Agent Configuration")
         print(f"{user_interface.Fore.GREEN}Your preferences have been saved.{user_interface.Style.RESET_ALL}")
+
+        # +++++++++++++ SART OF NEW .PLIST GENERATION LOGIC +++++++++++++
+        if platform.system() == "Darwin":
+            try:
+                script_file_path = Path(__file__).resolve()
+                work_dir_for_plist = script_file_path.parent # This is the project root
+
+                print(f"DEBUG_SIGNUP: Path(__file__).resolve() (script_file_path): {script_file_path}") # DEBUG
+                print(f"DEBUG_SIGNUP: work_dir_for_plist (passed as working_directory): {work_dir_for_plist}") # DEBUG
+
+                log_storage_dir = config_manager.CONFIG_DIR_PATH
+                user_name = os.getenv("USER", "defaultuser")
+                label_prefix_str = f"com.{user_name}"
+
+                plist_content_str = generate_launchd_plist_content(
+                    script_path=str(script_file_path),
+                    working_directory=str(work_dir_for_plist), # This IS project_root
+                    label_prefix=label_prefix_str,
+                    frequency_minutes=user_config[config_manager.SCHED_FREQUENCY_MINUTES_KEY],
+                    log_dir=str(log_storage_dir)
+                )
+
+                launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+                launch_agents_dir.mkdir(parents=True, exist_ok=True)
+
+                plist_filename = f"{label_prefix_str}.proactiveassistant.plist"
+                plist_file_path = launch_agents_dir / plist_filename
+
+                with open(plist_file_path, "w") as f:
+                    f.write(plist_content_str)
+
+
+                print(f"\n{user_interface.Fore.GREEN}A launchd agent file has been created at:{user_interface.Style.RESET_ALL}")
+                print(f"  {plist_file_path}")
+                print(f"\n{user_interface.Fore.YELLOW}To enable automatic background checks, open Terminal and run:{user_interface.Style.RESET_ALL}")
+                print(f"  launchctl load {plist_file_path}")
+                print(f"\n{user_interface.Fore.CYAN}The assistant will then run every {user_config[config_manager.SCHED_FREQUENCY_MINUTES_KEY]} minutes during your active hours/days.{user_interface.Style.RESET_ALL}")
+                print(f"Logs will be written to: {log_storage_dir}/assistant_out.log and assistant_err.log")
+                print(f"To stop automatic checks, run:")
+                print(f"  launchctl unload {plist_file_path}")
+
+            except Exception as e:
+                print(f"\n{user_interface.Fore.RED}Error creating launchd agent file: {e}{user_interface.Style.RESET_ALL}")
+                print(f"{user_interface.Fore.YELLOW}You will need to set up scheduling manually if desired.{user_interface.Style.RESET_ALL}")
     else:
         print(f"{user_interface.Fore.RED}Error: Could not save your configuration.{user_interface.Style.RESET_ALL}")
         sys.exit("Failed to save user configuration.")
     return user_config
+
+
+
 
 # --- Main Application Logic (Async now) ---
 async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool, List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -352,6 +471,7 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
                     actionable_events_llm_data.append(pe_data)
 
     # --- Send Notifications ---
+    notification_sent_this_cycle = False # Track if a notification was actually sent
     num_imp_emails = len(important_emails_llm_data)
     num_act_events = len(actionable_events_llm_data) # Use this for notification
 
@@ -368,11 +488,37 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
                  notif_message_parts.append(f"{len(raw_calendar_events)} upcoming event(s)")
 
 
-            if notif_message_parts: # Only send if there's something to say based on prefs
-                notifier.send_macos_notification(notif_title, ", ".join(notif_message_parts) + " requiring attention.")
-        else:
-            print(f"{user_interface.Style.DIM}No new important items for notification this cycle.{user_interface.Style.RESET_ALL}")
+            if notif_message_parts:
+                # --- Determine paths for notification action ---
+                python_executable = sys.executable
+                script_file_path_obj = Path(__file__).resolve() # Path object to assistant.py
+                work_dir_obj = script_file_path_obj.parent    # Path object to project directory
 
+                # The action script will be assistant.py itself, and we'll add the flag later
+                # when constructing the command for osascript.
+                # For now, script_to_run_on_action is just the path to assistant.py.
+                # The --from-notification flag will be handled by the command_to_run_in_terminal construction.
+
+                notifier.send_macos_notification(
+                    notif_title,
+                    ", ".join(notif_message_parts) + " requiring attention.",
+                    python_executable_for_action=str(python_executable),
+                    script_to_run_on_action=str(script_file_path_obj), # Just the script path
+                    working_dir_for_action=str(work_dir_obj)
+                )
+                notification_sent_this_cycle = True
+
+        else: # No important items
+            if sys.stdin.isatty(): # Only print if interactive
+                print(f"{user_interface.Style.DIM}No new important items for notification this cycle.{user_interface.Style.RESET_ALL}")
+            else: # Log for non-interactive runs
+                print(f"NOTIF_LOG: No new important items for notification this cycle at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # +++++++++++++ SAVE ACTIONABLE DATA IF NOTIFICATION WAS SENT +++++++++++++
+    if notification_sent_this_cycle: # Only save if we actually notified the user
+        config_manager.save_actionable_data(important_emails_llm_data, actionable_events_llm_data)
+    else: # If no notification, clear any old actionable data
+        config_manager.clear_actionable_data()
 
     print(f"{user_interface.Style.DIM}Proactive checks cycle complete.{user_interface.Style.RESET_ALL}")
     return True, important_emails_llm_data, actionable_events_llm_data # Return the filtered list
@@ -843,7 +989,7 @@ async def handle_create_calendar_event(
 
 
 
-async def main_assistant_entry():
+async def main_assistant_entry(run_mode: str = "normal"):
     """Entry point for the assistant logic."""
     # --- Initial setup ---
     if not config_manager.DEV_CONFIG.get(config_manager.ENV_GOOGLE_API_KEY):
@@ -884,46 +1030,81 @@ async def main_assistant_entry():
         return 1 # Error exit code
 # outer action loop removed
 
-    can_continue, actionable_emails_list, actionable_events_list = await perform_proactive_checks(user_configuration, gemini_llm_model) # Renamed for clarity
+    # --- ACTIVE DAY/HOUR CHECK FOR LAUNCHD ---
+    # This check is now primary. If launchd runs it outside these times, it does nothing.
+    active_days = user_configuration.get(config_manager.SCHED_ACTIVE_DAYS_KEY, [])
+    active_start_hour = user_configuration.get(config_manager.SCHED_ACTIVE_START_HOUR_KEY, -1) # Use invalid defaults
+    active_end_hour = user_configuration.get(config_manager.SCHED_ACTIVE_END_HOUR_KEY, -1)
 
-    if not can_continue:
-        print(f"{user_interface.Fore.YELLOW}Cycle paused: user action (e.g., auth) required. Exiting this run.{user_interface.Style.RESET_ALL}")
-        return 0 # Normal exit, pending user browser action for next run
+    now_ist = datetime.now(calendar_utils.IST) # Use IST
+    if not (now_ist.weekday() in active_days and \
+            active_start_hour <= now_ist.hour < active_end_hour):
+        print(f"{user_interface.Style.DIM}Current time {now_ist.strftime('%A %H:%M')} is outside active schedule ({active_days}, {active_start_hour}:00-{active_end_hour}:00). Skipping checks.{user_interface.Style.RESET_ALL}")
+        return 0 # Normal exit, just not active time
 
-    if sys.stdin.isatty():
-    # Check if the FILTERED lists are empty
-        if not actionable_emails_list and not actionable_events_list:
-            print(f"\n{user_interface.Fore.GREEN}No actionable items found in this cycle.{user_interface.Style.RESET_ALL}")
+    actionable_emails_list = []
+    actionable_events_list = []
+    can_proceed_to_interaction = False
+
+    # --- MODIFICATION FOR RUN MODE ---
+    actionable_emails_list = []
+    actionable_events_list = []
+    can_proceed_to_interaction = False
+
+    if run_mode == "from_notification":
+        print(f"{user_interface.Style.DIM}Loading data from last notification check...{user_interface.Style.RESET_ALL}")
+        loaded_data = config_manager.load_actionable_data() # Uses default max_age
+        if loaded_data:
+            actionable_emails_list = loaded_data.get("emails", [])
+            actionable_events_list = loaded_data.get("events", [])
+            can_proceed_to_interaction = True
+             # Clear the data after loading so it's not re-used if user quits and re-runs manually
+            config_manager.clear_actionable_data()
+        else:
+            print(f"{user_interface.Fore.YELLOW}Could not load recent actionable data. Performing a fresh check...{user_interface.Style.RESET_ALL}")
+            # Fall through to normal check
+            # No active day/hour check here, as user explicitly clicked notification
+
+    if not can_proceed_to_interaction: # Normal run or fallback from failed load
+        # Active day/hour check for non-notification triggered runs (e.g. launchd direct call)
+        if run_mode == "normal" and not (now_ist.weekday() in active_days and active_start_hour <= now_ist.hour < active_end_hour):
+            print(f"{user_interface.Style.DIM}Current time {now_ist.strftime('%A %H:%M')} is outside active schedule. Skipping checks.{user_interface.Style.RESET_ALL}")
+            return 0
+            # No active day/hour check here, as user explicitly clicked notification
+
+        continue_after_checks, emails_from_check, events_from_check = await perform_proactive_checks(
+            user_configuration, gemini_llm_model
+        )
+        if not continue_after_checks: # Auth needed
+            print(f"{user_interface.Fore.YELLOW}Cycle paused: user action (e.g., auth) required. Exiting this run.{user_interface.Style.RESET_ALL}")
+            return 0
+        actionable_emails_list = emails_from_check
+        actionable_events_list = events_from_check
+        can_proceed_to_interaction = True # Data is now fresh
+
+    # --- End of MODIFICATION FOR RUN MODE ---
+
+    if sys.stdin.isatty() and can_proceed_to_interaction:
+        if not actionable_emails_list and not actionable_events_list: # Check if lists are truly empty
+            print(f"\n{user_interface.Fore.GREEN}No actionable items found to interact with.{user_interface.Style.RESET_ALL}")
         else:
             first_display_of_items = True
             while True:
                 action_choice_data = user_interface.display_processed_data_and_get_action(
-                    actionable_emails_list, actionable_events_list, first_time_display=first_display_of_items
+                    actionable_emails_list,
+                    actionable_events_list,
+                    first_time_display=first_display_of_items
                 )
                 first_display_of_items = False
 
+                first_display_of_items = False
                 if not action_choice_data:
-                    if not actionable_emails_list and not actionable_events_list:
-                        break
-                    else:
-                        print(f"{user_interface.Fore.YELLOW}Please try your selection again or choose 'd' (done), 'r' (redisplay), or 'q' (quit).{user_interface.Style.RESET_ALL}")
-                        continue
-
-
+                    if not actionable_emails_list and not actionable_events_list: break
+                    else: print(f"{user_interface.Fore.YELLOW}Try selection again or 'd', 'r', 'q'.{user_interface.Style.RESET_ALL}"); continue
                 action_type, item_idx, action_idx_in_llm_suggestions, raw_choice = action_choice_data
-
-                if action_type == "done":
-                    print(f"{user_interface.Fore.YELLOW}Done with actions for this set of items.{user_interface.Style.RESET_ALL}")
-                    break # Break from inner action loop
-                elif action_type == "quit_assistant":
-                    print(f"{user_interface.Fore.YELLOW}Quitting assistant as per user request.{user_interface.Style.RESET_ALL}")
-                    # For a launchd/cron job, we just want this run to end.
-                    # If this function is the main entry for the script, returning here exits the script.
-                    return 0
-                elif action_type == "redisplay":
-                    first_display_of_items = True
-                    continue
-
+                if action_type == "done": print(f"{user_interface.Fore.YELLOW}Done with actions.{user_interface.Style.RESET_ALL}"); break
+                elif action_type == "quit_assistant": print(f"{user_interface.Fore.YELLOW}Quitting.{user_interface.Style.RESET_ALL}"); return 0
+                elif action_type == "redisplay": first_display_of_items = True; continue
                 action_succeeded_this_turn = False
 
 
@@ -1013,24 +1194,32 @@ async def main_assistant_entry():
 
                     pass
 
-                if action_succeeded_this_turn:
-                    print(f"{user_interface.Fore.GREEN}Action '{raw_choice}' processed.{user_interface.Style.RESET_ALL}")
-                    print(f"{user_interface.Style.DIM}The displayed list might be stale. Use 'r' to refresh items for this cycle.{user_interface.Style.RESET_ALL}")
-                elif action_type in ["email", "event"]:
-                    print(f"{user_interface.Fore.YELLOW}Action '{raw_choice}' was not fully completed or not applicable.{user_interface.Style.RESET_ALL}")
+                if action_succeeded_this_turn: print(f"{user_interface.Fore.GREEN}Action '{raw_choice}' processed.{user_interface.Style.RESET_ALL}")
+                elif action_type in ["email", "event"]: print(f"{user_interface.Fore.YELLOW}Action '{raw_choice}' not completed.{user_interface.Style.RESET_ALL}")
+            print(f"\n{user_interface.Style.DIM}Finished interacting.{user_interface.Style.RESET_ALL}")
 
-            # --- End of your inner action loop ---
-            print(f"\n{user_interface.Style.DIM}Finished interacting with current set of proactive items.{user_interface.Style.RESET_ALL}")
-    else: # Not in a TTY (e.g., run by launchd / cron)
-        print("Non-interactive run: Proactive checks completed. Notifications (if any) sent.")
+    elif not sys.stdin.isatty() and can_proceed_to_interaction: # Non-interactive run (launchd) that had data
+        print("Non-interactive run: Proactive checks resulted in actionable items. Notifications sent if applicable.")
+    elif not sys.stdin.isatty() and not can_proceed_to_interaction: # Non-interactive run, no data/error
+        print("Non-interactive run: No new actionable items or cycle paused due to pending user action.")
+
 
     print(f"\n{user_interface.Style.DIM}Proactive Assistant Cycle Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.{user_interface.Style.RESET_ALL}")
-    return 0 # Successful exit for this run
+    return 0
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Proactive Assistant")
+    parser.add_argument(
+        "--from-notification",
+        action="store_true",
+        help="Indicates the script is run from a notification action."
+    )
+    args = parser.parse_args()
+
+    current_run_mode = "from_notification" if args.from_notification else "normal"
+
     try:
-        exit_code = asyncio.run(main_assistant_entry())
-        # Ensure exit_code is an int for sys.exit()
+        exit_code = asyncio.run(main_assistant_entry(run_mode=current_run_mode)) # Pass run_mode
         sys.exit(exit_code if isinstance(exit_code, int) else 0)
     except KeyboardInterrupt:
         print(f"\n{user_interface.Fore.YELLOW}Assistant stopped by user. Goodbye!{user_interface.Style.RESET_ALL}")

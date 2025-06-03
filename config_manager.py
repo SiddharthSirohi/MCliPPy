@@ -4,6 +4,7 @@ import json
 from dotenv import load_dotenv # Make sure this is imported
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional, Dict, List, Any
 
 # --- Constants for User Config Keys ---
 USER_EMAIL_KEY = "USER_EMAIL_FOR_COMPOSIO"
@@ -30,9 +31,12 @@ CONFIG_DIR_NAME = ".proactive_assistant"
 USER_CONFIG_FILE_NAME = "user_config.json"
 ENV_FILE_NAME = ".env"
 
+TEMP_ACTIONABLE_DATA_FILE_NAME = "last_actionable_data.json"
 HOME_DIR = Path.home()
-CONFIG_DIR_PATH = HOME_DIR / CONFIG_DIR_NAME
-USER_CONFIG_FILE_PATH = CONFIG_DIR_PATH / USER_CONFIG_FILE_NAME
+CONFIG_DIR_PATH = HOME_DIR / CONFIG_DIR_NAME # Defined here
+USER_CONFIG_FILE_PATH = CONFIG_DIR_PATH / USER_CONFIG_FILE_NAME # Uses CONFIG_DIR_PATH
+
+TEMP_ACTIONABLE_DATA_FILE_PATH = CONFIG_DIR_PATH / TEMP_ACTIONABLE_DATA_FILE_NAME
 
 def load_env_vars():
     project_root = Path(__file__).resolve().parent
@@ -118,8 +122,64 @@ def set_last_email_check_timestamp(timestamp: datetime = None):
         timestamp = datetime.now(timezone.utc)
     update_user_config_value("LAST_EMAIL_CHECK_TIMESTAMP", timestamp.isoformat())
 
-# --- Initial Setup ---
-# Load environment variables when the module is imported
+
+# config_manager.py
+# ... (existing constants) ...
+TEMP_ACTIONABLE_DATA_FILE_NAME = "last_actionable_data.json"
+TEMP_ACTIONABLE_DATA_FILE_PATH = CONFIG_DIR_PATH / TEMP_ACTIONABLE_DATA_FILE_NAME # In ~/.proactive_assistant/
+
+# ... (existing functions) ...
+
+def save_actionable_data(emails_data: List[Dict[str, Any]], events_data: List[Dict[str, Any]]):
+    """Saves the actionable emails and events to a temporary file."""
+    _ensure_config_dir_exists()
+    data_to_save = {
+        "emails": emails_data,
+        "events": events_data,
+        "timestamp": datetime.now(timezone.utc).isoformat() # For relevance check
+    }
+    try:
+        with open(TEMP_ACTIONABLE_DATA_FILE_PATH, 'w') as f:
+            json.dump(data_to_save, f, indent=2)
+        # print(f"DEBUG: Actionable data saved to {TEMP_ACTIONABLE_DATA_FILE_PATH}")
+        return True
+    except Exception as e:
+        print(f"CONFIG_ERROR: Error saving actionable data: {e}")
+        return False
+
+def load_actionable_data(max_age_seconds: int = 300) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+    """
+    Loads actionable data if the file exists and is recent enough.
+    Returns {"emails": [...], "events": [...]} or None.
+    """
+    if TEMP_ACTIONABLE_DATA_FILE_PATH.exists():
+        try:
+            with open(TEMP_ACTIONABLE_DATA_FILE_PATH, 'r') as f:
+                data = json.load(f)
+
+            saved_timestamp_str = data.get("timestamp")
+            if saved_timestamp_str:
+                saved_timestamp = datetime.fromisoformat(saved_timestamp_str)
+                if (datetime.now(timezone.utc) - saved_timestamp).total_seconds() <= max_age_seconds:
+                    # print(f"DEBUG: Loaded recent actionable data from {TEMP_ACTIONABLE_DATA_FILE_PATH}")
+                    return {"emails": data.get("emails", []), "events": data.get("events", [])}
+                else:
+                    print(f"CONFIG_INFO: Stored actionable data is too old (older than {max_age_seconds}s). Ignoring.")
+            else:
+                print("CONFIG_INFO: Stored actionable data has no timestamp. Ignoring.")
+        except Exception as e:
+            print(f"CONFIG_ERROR: Error loading actionable data: {e}")
+    return None
+
+def clear_actionable_data():
+    """Clears the temporary actionable data file."""
+    if TEMP_ACTIONABLE_DATA_FILE_PATH.exists():
+        try:
+            TEMP_ACTIONABLE_DATA_FILE_PATH.unlink()
+            # print(f"DEBUG: Cleared actionable data file: {TEMP_ACTIONABLE_DATA_FILE_PATH}")
+        except Exception as e:
+            print(f"CONFIG_ERROR: Error clearing actionable data file: {e}")
+
 DEV_CONFIG = load_env_vars()
 
 # --- Main for testing this module ---
