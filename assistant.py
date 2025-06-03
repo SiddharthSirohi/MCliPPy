@@ -662,13 +662,34 @@ async def handle_draft_email_reply(
                     message_body=draft_body
                 )
 
-            if send_reply_outcome.get("successful"):
-                print(f"{user_interface.Fore.GREEN}Success! {send_reply_outcome.get('message', 'Reply sent.')}{user_interface.Style.RESET_ALL}")
-                return True
-            else:
-                error_msg = send_reply_outcome.get('error', 'Failed to send reply via MCP.')
-                print(f"{user_interface.Fore.RED}MCP Error sending reply: {error_msg}{user_interface.Style.RESET_ALL}")
-                return False
+                if send_reply_outcome.get("successful"):
+                    print(f"{user_interface.Fore.GREEN}Success! {send_reply_outcome.get('message', 'Reply sent.')}{user_interface.Style.RESET_ALL}")
+                    # +++++++++++++ MARK THREAD AS READ +++++++++++++
+                    # original_message_id = chosen_email_data.get("original_email_data", {}).get("messageId") # We need threadId now
+                    original_thread_id_for_mark = chosen_email_data.get("original_email_data", {}).get("threadId")
+
+                    if original_thread_id_for_mark: # Make sure we have a threadId
+                        print(f"{user_interface.Style.DIM}Attempting to mark original email thread ({original_thread_id_for_mark}) as read...{user_interface.Style.RESET_ALL}")
+
+                        mark_read_outcome = await exec_gmail_manager.mark_thread_as_read( # Call new method
+                            thread_id=original_thread_id_for_mark
+                        )
+
+                        if mark_read_outcome.get("successful"):
+                            print(f"{user_interface.Fore.GREEN}Original email thread marked as read.{user_interface.Style.RESET_ALL}")
+                        else:
+                            print(f"{user_interface.Fore.YELLOW}Could not mark original email thread as read: {mark_read_outcome.get('error')}{user_interface.Style.RESET_ALL}")
+                    else:
+                        print(f"{user_interface.Fore.YELLOW}Could not find threadId for original email to mark as read.{user_interface.Style.RESET_ALL}")
+                    # ++++++++++++++++++++++++++++++++++++++++++++++++
+                    return True
+                else:
+                    error_msg = send_reply_outcome.get('error', 'Failed to send reply via MCP.')
+                    print(f"{user_interface.Fore.RED}MCP Error sending reply: {error_msg}{user_interface.Style.RESET_ALL}")
+                if send_reply_outcome.get("successful"):
+                    return True # The 'send_reply' action was successful
+                else:
+                    return False # The 'send_reply' action failed
 
         elif confirmation_choice == "edit":
             user_edit_instructions = user_interface.get_user_input(f"{user_interface.Fore.CYAN}Your edit instructions (or type your full new draft):{user_interface.Style.RESET_ALL}")

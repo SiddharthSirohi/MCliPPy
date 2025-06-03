@@ -359,6 +359,79 @@ class McpSessionManager:
 
         return {"successful": False, "error": f"Unexpected or empty response from {tool_name}."}
 
+    async def mark_thread_as_read(self, thread_id: str) -> Dict[str, Any]: # Renamed method, takes thread_id
+        """
+        Marks an entire email thread as read by removing the 'UNREAD' label from it.
+        Uses Composio's GMAIL_MODIFY_THREAD_LABELS tool.
+        """
+        if not self.session:
+            return {"error": "No active Gmail MCP session.", "successful": False}
+
+        tool_name = "GMAIL_MODIFY_THREAD_LABELS" # <<< CHANGED TOOL SLUG
+
+        if tool_name not in self.tools:
+            msg = f"Tool '{tool_name}' not available. Ensure it's in Composio allowed_tools."
+            print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg}{user_interface.Style.RESET_ALL}")
+            return {"error": msg, "successful": False}
+
+        params = {
+            "thread_id": thread_id, # <<< CHANGED from message_id
+            "remove_label_ids": ["UNREAD"]
+            # "user_id": "me" # Defaults to "me"
+        }
+
+        print(f"MCP_SM ({self.app_name}): Attempting to mark thread ID '{thread_id}' as read using '{tool_name}'.")
+
+        outcome = await self.ensure_auth_and_call_tool(tool_name, params)
+
+
+        # --- Standard Parsing Logic for Composio's Response ---
+        print(f"MCP_SM ({self.app_name}): Raw outcome from {tool_name} for thread {thread_id}:")
+        if isinstance(outcome, dict): print(json.dumps(outcome, indent=2))
+        elif outcome and hasattr(outcome, 'content'):
+            print(f"  ToolCallResult.content: {outcome.content}")
+            if outcome.content and hasattr(outcome.content[0], 'text'):
+                print(f"  First content item text: {getattr(outcome.content[0], 'text', None)}")
+        else: print(f"  Outcome was None or unexpected: {outcome}")
+
+
+        if isinstance(outcome, dict) and outcome.get("error"): # Handles needs_user_action and other errors from ensure_auth_and_call_tool
+            return outcome
+
+        if outcome and hasattr(outcome, 'content') and outcome.content:
+            text_content = getattr(outcome.content[0], 'text', None)
+            if text_content:
+                try:
+                    composio_response = json.loads(text_content)
+                    print(f"DEBUG_MCP_HANDLER (MarkThreadAsRead): Parsed composio_response: {json.dumps(composio_response, indent=2)}")
+
+                    if composio_response.get("successful") is True:
+                        # Google's threads.modify API returns the modified thread resource.
+                        modified_thread_data = composio_response.get("data", {}).get("response_data", {})
+                        print(f"{user_interface.Fore.GREEN}Successfully marked thread ID '{thread_id}' as read.{user_interface.Style.RESET_ALL}")
+                        return {"successful": True, "message": f"Thread {thread_id} marked as read.", "modified_thread_data": modified_thread_data}
+
+                    elif composio_response.get("successful") is False and composio_response.get("error") is not None:
+                        error_msg = str(composio_response.get("error"))
+                        print(f"{user_interface.Fore.RED}Composio tool '{tool_name}' (thread {thread_id}) reported failure: {error_msg}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": error_msg, "composio_reported_error": True}
+                    else:
+                        msg = f"Composio response for {tool_name} (thread {thread_id}) unclear."
+                        print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {msg} Response: {json.dumps(composio_response, indent=2)}{user_interface.Style.RESET_ALL}")
+                        return {"successful": False, "error": msg}
+                except json.JSONDecodeError:
+                    msg = f"Could not parse {tool_name} JSON response for thread {thread_id}."
+                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg} Raw: {text_content[:200]}...{user_interface.Style.RESET_ALL}")
+                    return {"successful": False, "error": msg}
+            else:
+                msg = f"No text content in {tool_name} response item for thread {thread_id}."
+                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {msg}{user_interface.Style.RESET_ALL}")
+                return {"successful": False, "error": msg}
+
+        msg = f"Unhandled result structure from {tool_name} for thread {thread_id}."
+        print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg} Raw: {outcome}{user_interface.Style.RESET_ALL}")
+        return {"successful": False, "error": msg}
+
     async def delete_calendar_event(self, event_id: str, calendar_id: str = "primary") -> Dict[str, Any]:
         """
         Uses Composio's GOOGLECALENDAR_DELETE_EVENT tool.
