@@ -1008,10 +1008,38 @@ async def handle_create_calendar_event(
             # ... (error message)
             return False
 
+# +++++++++++++ NEW FUNCTION TO PRINT ASCII ART +++++++++++++
+def display_welcome_art():
+    """Reads and prints ASCII art from ascii.txt if it exists."""
+    try:
+        # Assume ascii.txt is in the same directory as assistant.py
+        script_dir = Path(__file__).resolve().parent
+        ascii_file_path = script_dir / "ascii.txt"
+        if ascii_file_path.exists():
+            with open(ascii_file_path, 'r', encoding='utf-8') as f:
+                art = f.read()
+                print(f"{user_interface.Fore.BLUE}{art}{user_interface.Style.RESET_ALL}")
+                # Add a little welcome message below the art
+                print(f"{user_interface.Style.BRIGHT}MCliPPy - Your Proactive MCP Assistant{user_interface.Style.RESET_ALL}")
+                print("-" * 60) # A separator line
+        else:
+            print(f"{user_interface.Style.BRIGHT}MCliPPy - Proactive MCP Assistant{user_interface.Style.RESET_ALL}") # Fallback if no art
+            print("-" * 60)
+    except Exception as e:
+        print(f"Could not display welcome art: {e}")
+        print(f"{user_interface.Style.BRIGHT}MCliPPy - Proactive MCP Assistant{user_interface.Style.RESET_ALL}") # Fallback
+        print("-" * 60)
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 
 async def main_assistant_entry(run_mode: str = "normal"):
     """Entry point for the assistant logic."""
+
+    # +++++++++++++ CALL WELCOME ART DISPLAY (if interactive) +++++++++++++
+    if sys.stdin.isatty(): # Only display art for interactive manual runs
+        display_welcome_art()
+    # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
     # --- Initial setup ---
     if not config_manager.DEV_CONFIG.get(config_manager.ENV_GOOGLE_API_KEY):
         # For launchd, this should ideally log to a file.
