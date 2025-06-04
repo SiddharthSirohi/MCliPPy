@@ -8,7 +8,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
-import google.generativeai as genai
+from google import genai
 
 # Import our modules
 import config_manager
@@ -18,6 +18,7 @@ import notifier
 import user_interface
 import calendar_utils
 
+MODEL_NAME = "gemini-2.5-flash-preview-05-20"
 
 # --- Helper for User Input & Signup Flow (from user_interface.py now) ---
 # These are called from user_interface.py, so no need to redefine here.
@@ -270,7 +271,7 @@ def run_signup_flow(): # Stays in assistant.py as it uses config_manager directl
 
 
 # --- Main Application Logic (Async now) ---
-async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool, List[Dict[str, Any]], List[Dict[str, Any]]]:
+async def perform_proactive_checks(user_config: Dict[str, Any], gemini_client: genai.Client, model_name: str) -> tuple[bool, List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Performs one cycle of proactive checks for Gmail and Calendar.
     Processes fetched data with LLM.
@@ -385,7 +386,7 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
     if all_fetched_raw_messages and user_config.get(config_manager.NOTIFICATION_PREFS_KEY, {}).get("email", "off") == "important":
         # user_interface.print_header(f"Processing {len(all_fetched_raw_messages)} Gmail messages with LLM")
         processed_emails_from_llm = await llm_processor.process_emails_with_llm(
-            gemini_llm_model, all_fetched_raw_messages, user_persona, user_priorities
+            gemini_client, model_name, all_fetched_raw_messages, user_persona, user_priorities
         )
         if processed_emails_from_llm:
             for pe_data in processed_emails_from_llm:
@@ -463,8 +464,13 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
     actionable_events_llm_data = [] # New list for only actionable events
     if raw_calendar_events and user_config.get(config_manager.NOTIFICATION_PREFS_KEY, {}).get("calendar", "off") != "off":
         processed_events_from_llm_temp = await llm_processor.process_calendar_events_with_llm(
-            gemini_llm_model, raw_calendar_events, user_persona, user_priorities, user_config
-        )
+                    gemini_client,       # The genai.Client instance
+                    model_name,          # The string for the model name
+                    raw_calendar_events,
+                    user_config,         # The user_config dictionary
+                    user_persona,
+                    user_priorities
+                )# CORRECTED ARGUMENTS
         if processed_events_from_llm_temp:
             for pe_data in processed_events_from_llm_temp:
                 if pe_data.get('suggested_actions'): # Only include if LLM gave actions
@@ -525,7 +531,7 @@ async def perform_proactive_checks(user_config, gemini_llm_model) -> tuple[bool,
 
 
 async def handle_draft_email_reply(
-    gemini_llm_model,
+    gemini_client: genai.Client, model_name: str,
     chosen_email_data: Dict[str, Any],
     initial_llm_action_text: str,
     user_config: Dict[str, Any]
@@ -612,7 +618,7 @@ async def handle_draft_email_reply(
     # Initial draft generation
     print(f"\n{user_interface.Style.DIM}Drafting reply for '{chosen_email_data['original_email_data'].get('subject', 'N/A')}'...{user_interface.Style.RESET_ALL}")
     current_draft_info = await llm_processor.draft_email_reply_with_llm(
-        gemini_llm_model,
+        gemini_client, MODEL_NAME,
         chosen_email_data['original_email_data'],
         initial_llm_action_text,
         user_persona,
@@ -695,7 +701,7 @@ async def handle_draft_email_reply(
             user_edit_instructions = user_interface.get_user_input(f"{user_interface.Fore.CYAN}Your edit instructions (or type your full new draft):{user_interface.Style.RESET_ALL}")
             print(f"{user_interface.Style.DIM}Re-drafting with your instructions...{user_interface.Style.RESET_ALL}")
             current_draft_info = await llm_processor.draft_email_reply_with_llm(
-                gemini_llm_model,
+                gemini_client, MODEL_NAME,
                 chosen_email_data['original_email_data'],
                 initial_llm_action_text,
                 user_persona,
@@ -887,7 +893,7 @@ async def handle_update_calendar_event(
 
 
 async def handle_create_calendar_event(
-    gemini_llm_model,
+    gemini_client: genai.Client, model_name: str,
     llm_suggestion_text: str,
     original_context_text: Optional[str],
     user_config: Dict[str, Any]
@@ -906,7 +912,7 @@ async def handle_create_calendar_event(
     print(f"\n{user_interface.Style.DIM}Assistant is parsing details for new event based on: '{llm_suggestion_text}'...{user_interface.Style.RESET_ALL}")
 
     current_event_creation_details = await llm_processor.parse_event_creation_details_from_suggestion(
-        gemini_llm_model=gemini_llm_model,
+        gemini_client, MODEL_NAME,
         llm_suggestion_text=llm_suggestion_text,
         original_context_text=original_context_text,
         user_persona=user_persona,
@@ -1069,14 +1075,18 @@ async def main_assistant_entry(run_mode: str = "normal"):
 
     google_api_key = config_manager.DEV_CONFIG.get(config_manager.ENV_GOOGLE_API_KEY)
     try:
-        genai.configure(api_key=google_api_key)
-        gemini_llm_model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
-        if sys.stdin.isatty(): # <<<< ADDED CHECK (optional)
-            print(f"{user_interface.Fore.GREEN}Gemini model initialized successfully.{user_interface.Style.RESET_ALL}")
+        gemini_client = genai.Client(api_key=google_api_key)
+        # Optional: A simple test call to ensure client is working, e.g., listing models
+        # models_list = list(gemini_client.list_models())
+        # if not any(MODEL_NAME in m.name for m in models_list):
+        #     print(f"{user_interface.Fore.RED}Model {MODEL_NAME} not found. Available models: {[m.name for m in models_list]}{user_interface.Style.RESET_ALL}")
+        #     # Potentially exit if primary model isn't available
+        if sys.stdin.isatty():
+            print(f"{user_interface.Fore.GREEN}Gemini client initialized successfully for model {MODEL_NAME}.{user_interface.Style.RESET_ALL}")
     except Exception as e:
-        print(f"{user_interface.Fore.RED}Failed to initialize Gemini model: {e}{user_interface.Style.RESET_ALL}")
+        print(f"{user_interface.Fore.RED}Failed to initialize Gemini client: {e}{user_interface.Style.RESET_ALL}")
         traceback.print_exc()
-        return 1 # Error exit code
+        return 1
 # outer action loop removed
 
     # --- ACTIVE DAY/HOUR CHECK FOR LAUNCHD ---
@@ -1122,8 +1132,8 @@ async def main_assistant_entry(run_mode: str = "normal"):
             # No active day/hour check here, as user explicitly clicked notification
 
         continue_after_checks, emails_from_check, events_from_check = await perform_proactive_checks(
-            user_configuration, gemini_llm_model
-        )
+                    user_configuration, gemini_client, MODEL_NAME
+                )
         if not continue_after_checks: # Auth needed
             print(f"{user_interface.Fore.YELLOW}Cycle paused: user action (e.g., auth) required. Exiting this run.{user_interface.Style.RESET_ALL}")
             return 0
@@ -1173,7 +1183,7 @@ async def main_assistant_entry(run_mode: str = "normal"):
                         "suggest" in chosen_llm_action_text.lower():
 
                         action_succeeded_this_turn = await handle_draft_email_reply(
-                            gemini_llm_model,
+                            gemini_client, MODEL_NAME,
                             chosen_email_data,
                             chosen_llm_action_text,
                             user_configuration
@@ -1187,7 +1197,7 @@ async def main_assistant_entry(run_mode: str = "normal"):
                         original_email_body_for_context = chosen_email_data.get("original_email_data", {}).get("messageText") or \
                                                             chosen_email_data.get("original_email_data", {}).get("snippet","No original email body available for context.")
                         action_succeeded_this_turn = await handle_create_calendar_event(
-                            gemini_llm_model,
+                            gemini_client, MODEL_NAME,
                             chosen_llm_action_text,
                             original_email_body_for_context,
                             user_configuration
@@ -1207,7 +1217,7 @@ async def main_assistant_entry(run_mode: str = "normal"):
                         print(f"{user_interface.Style.BRIGHT}Chosen LLM Suggested Action: {user_interface.Fore.GREEN}{chosen_llm_action_text}{user_interface.Style.RESET_ALL}")
 
                         # --- MODIFICATION FOR CALENDAR ACTIONS ---
-                        if "update this event's details" in chosen_llm_action_text.lower() or \
+                        if "update" in chosen_llm_action_text.lower() or \
                             "reschedule" in chosen_llm_action_text.lower() or \
                             "change title" in chosen_llm_action_text.lower() or \
                             "add attendee" in chosen_llm_action_text.lower() or \
@@ -1230,7 +1240,7 @@ async def main_assistant_entry(run_mode: str = "normal"):
                                 "block additional time" in chosen_llm_action_text.lower():
 
                             action_succeeded_this_turn = await handle_create_calendar_event(
-                                gemini_llm_model,
+                                gemini_client, MODEL_NAME,
                                 chosen_llm_action_text,
                                 original_event_summary_for_context,
                                 user_configuration
