@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from google import genai
+from google.genai import types as genai_types # For types like GenerateContentConfig, Part, Content
 
 # Import our modules
 import config_manager
@@ -637,65 +638,65 @@ from mcp.types import Tool, CallToolResult
 import asyncio
 import weakref
 
-class MergedMCPSession:
-    """A virtual session that merges tools from multiple MCP sessions, handling duplicates"""
 
-    def __init__(self, sessions: List[ClientSession], session_managers: Dict[str, Any]):
-        self.sessions = sessions
-        self.session_managers = session_managers
-        self.tool_routing: Dict[str, ClientSession] = {}
-        self.merged_tools: List[Tool] = []
-        self._session_refs = [weakref.ref(session) for session in sessions]  # Weak references
-        self._build_tool_mapping()
+class ConversationHistory:
+    """Manages conversation history for the assistant"""
 
-    def _build_tool_mapping(self):
-        """Build merged tool list and routing map, handling duplicates"""
-        seen_tools = {}
+    def __init__(self):
+        self.history: List[genai_types.Content] = []
 
-        # Priority: Calendar tools first (they tend to have fewer conflicts)
-        session_priority = []
-        if 'calendar' in self.session_managers:
-            session_priority.append(('calendar', self.session_managers['calendar'].session))
-        if 'gmail' in self.session_managers:
-            session_priority.append(('gmail', self.session_managers['gmail'].session))
+    def add_user_message(self, message: str):
+        """Add a user message to history"""
+        self.history.append(genai_types.Content(
+            role="user",
+            parts=[genai_types.Part.from_text(text=message)]
+        ))
 
-        for session_name, session in session_priority:
-            manager = self.session_managers[session_name]
-            for tool_name, tool_obj in manager.tools.items():
-                if tool_name not in seen_tools:
-                    # First occurrence - add to merged tools
-                    seen_tools[tool_name] = session_name
-                    self.tool_routing[tool_name] = session
-                    self.merged_tools.append(tool_obj)
-                    print(f"   Merged tool: {tool_name} -> {session_name}")
-                else:
-                    # Conflict - log which session's tool we're skipping
-                    existing_session = seen_tools[tool_name]
-                    print(f"   Skipped duplicate: {tool_name} (keeping {existing_session}, skipping {session_name})")
+    def add_assistant_message(self, message: str):
+        """Add an assistant message to history"""
+        self.history.append(genai_types.Content(
+            role="model",
+            parts=[genai_types.Part.from_text(text=message)]
+        ))
 
-        print(f"   Total merged tools: {len(self.merged_tools)} (from {len(self.sessions)} sessions)")
+    def add_function_call(self, function_call, tool_name: str, tool_result: Dict[str, Any]):
+        """Add function call and result to history"""
+        # Add the function call
+        self.history.append(genai_types.Content(
+            role="model",
+            parts=[genai_types.Part.from_function_call(
+                name=function_call.name,
+                args=dict(function_call.args)
+            )]
+        ))
 
-    async def list_tools(self):
-        """Return merged tool list"""
-        return type('ToolsResponse', (), {'tools': self.merged_tools})()
+        # Add the function response
+        self.history.append(genai_types.Content(
+            role="tool",
+            parts=[genai_types.Part.from_function_response(
+                name=tool_name,
+                response=tool_result
+            )]
+        ))
 
-    async def call_tool(self, name: str, arguments: dict):
-        """Route tool call to appropriate session"""
-        if name not in self.tool_routing:
-            raise ValueError(f"Tool {name} not found in merged session")
+    def get_history(self) -> List[genai_types.Content]:
+        """Get the conversation history"""
+        return self.history.copy()
 
-        target_session = self.tool_routing[name]
+    def clear_history(self):
+        """Clear conversation history"""
+        self.history.clear()
 
-        # Check if session is still alive
-        if not any(ref() is target_session for ref in self._session_refs if ref() is not None):
-            raise ValueError(f"Target session for tool {name} is no longer available")
+    def get_recent_history(self, max_exchanges: int = 10) -> List[genai_types.Content]:
+        """Get recent conversation history limited by exchanges"""
+        # Limit to prevent context window overflow
+        if len(self.history) <= max_exchanges * 2:  # Rough estimate
+            return self.history.copy()
+        else:
+            return self.history[-(max_exchanges * 2):]
 
-        return await target_session.call_tool(name, arguments)
-
-    def __del__(self):
-        """Cleanup - but don't close sessions as they're owned by managers"""
-        pass
-
+# Create global conversation history
+conversation_history = ConversationHistory()
 
 async def handle_nli_command(
     user_query: str,
@@ -707,42 +708,73 @@ async def handle_nli_command(
 ):
     print(f"{user_interface.Style.DIM}Processing your request: '{user_query}'...{user_interface.Style.RESET_ALL}")
 
-    # Connect all available managers with proper error handling
-    available_managers = {}
-    active_sessions = []
-
+    # Add user message to conversation history
+    conversation_history.add_user_message(user_query)
     try:
+        # Connect managers and choose primary session based on query intent
+        available_managers = {}
+        primary_session = None
+        primary_manager = None
+
+        # Smart session selection based on query content
+        query_lower = user_query.lower()
+        calendar_keywords = ["calendar", "event", "schedule", "meeting", "free", "time", "slot", "book", "create event"]
+        gmail_keywords = ["email", "gmail", "mail", "message", "reply", "send", "inbox", "fetch"]
+
+        prefers_calendar = any(keyword in query_lower for keyword in calendar_keywords)
+        prefers_gmail = any(keyword in query_lower for keyword in gmail_keywords)
+
+        # Connect both managers
         if gmail_mcp_manager:
             await gmail_mcp_manager.ensure_connected()
             if gmail_mcp_manager.session:
                 available_managers['gmail'] = gmail_mcp_manager
-                active_sessions.append(gmail_mcp_manager.session)
                 print(f"   Gmail session ready with {len(gmail_mcp_manager.tools)} tools")
 
         if calendar_mcp_manager:
             await calendar_mcp_manager.ensure_connected()
             if calendar_mcp_manager.session:
                 available_managers['calendar'] = calendar_mcp_manager
-                active_sessions.append(calendar_mcp_manager.session)
                 print(f"   Calendar session ready with {len(calendar_mcp_manager.tools)} tools")
 
-        if not available_managers:
-            user_interface.display_nli_llm_response("I can't access Gmail or Calendar tools right now. Please ensure they are connected.")
+        # Choose primary session based on query intent
+        if prefers_calendar and 'calendar' in available_managers:
+            primary_session = available_managers['calendar'].session
+            primary_manager = available_managers['calendar']
+            primary_type = 'calendar'
+        elif prefers_gmail and 'gmail' in available_managers:
+            primary_session = available_managers['gmail'].session
+            primary_manager = available_managers['gmail']
+            primary_type = 'gmail'
+        elif 'gmail' in available_managers:  # Default to gmail
+            primary_session = available_managers['gmail'].session
+            primary_manager = available_managers['gmail']
+            primary_type = 'gmail'
+        elif 'calendar' in available_managers:  # Fallback to calendar
+            primary_session = available_managers['calendar'].session
+            primary_manager = available_managers['calendar']
+            primary_type = 'calendar'
+
+        if not primary_session:
+            response_text = "I can't access Gmail or Calendar tools right now. Please ensure they are connected."
+            conversation_history.add_assistant_message(response_text)
+            user_interface.display_nli_llm_response(response_text)
             return
 
-        # Create merged session to handle tool conflicts
-        merged_session = MergedMCPSession(active_sessions, available_managers)
+        print(f"   Using {primary_type} as primary session for this query")
 
         # Store routing information for tool execution
         user_config['_available_managers'] = available_managers
-        user_config['_merged_session'] = merged_session
+        user_config['_conversation_history'] = conversation_history
+        user_config['_primary_manager'] = primary_manager
 
-        # Pass only the merged session to avoid conflicts
+        # Pass ONLY the primary session to avoid conflicts
         llm_response_or_fc = await llm_processor.get_llm_tool_call_from_natural_language(
-            gemini_client, MODEL_NAME, user_query, [merged_session], user_config
+            gemini_client, MODEL_NAME, user_query, [primary_session], user_config
         )
 
         if isinstance(llm_response_or_fc, str):
+            conversation_history.add_assistant_message(llm_response_or_fc)
             user_interface.display_nli_llm_response(llm_response_or_fc)
             return
 
@@ -754,15 +786,20 @@ async def handle_nli_command(
             tool_args = dict(function_call_obj.args)
 
             if user_interface.display_tool_confirmation_prompt(tool_name, tool_args):
-                # Use merged session routing
+                # Find the manager that has this tool
                 target_manager: Optional[McpSessionManager] = None
 
-                # Find which manager actually has this tool
-                for manager_name, manager in available_managers.items():
-                    if tool_name in manager.tools:
-                        target_manager = manager
-                        print(f"   Routing {tool_name} to {manager_name} manager")
-                        break
+                # First check primary manager
+                if tool_name in primary_manager.tools:
+                    target_manager = primary_manager
+                    print(f"   Routing {tool_name} to primary {primary_type} manager")
+                else:
+                    # Check other managers
+                    for manager_name, manager in available_managers.items():
+                        if tool_name in manager.tools:
+                            target_manager = manager
+                            print(f"   Routing {tool_name} to {manager_name} manager")
+                            break
 
                 if target_manager:
                     # Ensure connection is still active
@@ -771,14 +808,14 @@ async def handle_nli_command(
                     # Execute the tool
                     raw_mcp_tool_outcome = await target_manager.ensure_auth_and_call_tool(tool_name, tool_args)
 
-                    # Process the result (your existing logic)
+                    # Process the result
                     processed_tool_result_for_llm: Dict[str, Any]
 
                     if isinstance(raw_mcp_tool_outcome, dict):
                         processed_tool_result_for_llm = raw_mcp_tool_outcome
                     elif hasattr(raw_mcp_tool_outcome, 'content') and raw_mcp_tool_outcome.content and \
-                         hasattr(raw_mcp_tool_outcome.content[0], 'text') and \
-                         isinstance(raw_mcp_tool_outcome.content[0].text, str):
+                        hasattr(raw_mcp_tool_outcome.content[0], 'text') and \
+                        isinstance(raw_mcp_tool_outcome.content[0].text, str):
                         try:
                             composio_json_response_str = raw_mcp_tool_outcome.content[0].text
                             parsed_composio_response = json.loads(composio_json_response_str)
@@ -794,25 +831,37 @@ async def handle_nli_command(
                     else:
                         processed_tool_result_for_llm = {"successful": False, "error": "Unexpected tool response format"}
 
+                    # Add function call and result to conversation history
+                    conversation_history.add_function_call(function_call_obj, tool_name, processed_tool_result_for_llm)
+
+                    # Get final response
                     final_llm_response_text = await llm_processor.get_final_response_after_tool_execution(
                         gemini_client, MODEL_NAME,
                         user_query,
                         gemini_content_parts_for_next_turn,
                         tool_name,
                         processed_tool_result_for_llm,
-                        [merged_session],  # Pass merged session
+                        [primary_session],  # Pass primary session
                         user_config
                     )
+
+                    conversation_history.add_assistant_message(final_llm_response_text)
                     user_interface.display_nli_llm_response(final_llm_response_text)
                 else:
-                    user_interface.display_nli_llm_response(f"Sorry, I don't know how to execute the tool '{tool_name}'. It might not be available in any active session.")
+                    error_msg = f"Sorry, I don't know how to execute the tool '{tool_name}'. It might not be available in the current session."
+                    conversation_history.add_assistant_message(error_msg)
+                    user_interface.display_nli_llm_response(error_msg)
             else:
-                user_interface.display_nli_llm_response("Action cancelled by user.")
+                cancel_msg = "Action cancelled by user."
+                conversation_history.add_assistant_message(cancel_msg)
+                user_interface.display_nli_llm_response(cancel_msg)
 
     except Exception as e:
+        error_msg = f"Sorry, I encountered an error: {str(e)}"
         print(f"{user_interface.Fore.RED}Error in handle_nli_command: {e}{user_interface.Style.RESET_ALL}")
         traceback.print_exc()
-        user_interface.display_nli_llm_response(f"Sorry, I encountered an error: {str(e)}")
+        conversation_history.add_assistant_message(error_msg)
+        user_interface.display_nli_llm_response(error_msg)
 
 
 
@@ -873,12 +922,27 @@ async def main_assistant_entry(run_mode: str = "normal"):
     while True:
         if current_mode == "normal": # NLI-first
             nli_command_type, user_text_input = user_interface.get_nli_chat_input(run_mode="normal")
+
             if nli_command_type == "quit_assistant":
                 break
+
+            elif nli_command_type == "clear_history":
+                if user_interface.confirm_clear_history():
+                    conversation_history.clear_history()
+                    user_interface.display_history_cleared()
+                else:
+                    print(f"{user_interface.Fore.YELLOW}History clearing cancelled.{user_interface.Style.RESET_ALL}")
+                continue
+
+            elif nli_command_type == "show_history":
+                user_interface.display_conversation_history(conversation_history)
+                continue
+
             elif nli_command_type == "show_actionables":
                 current_mode = "actionables_from_nli" # Switch mode
                 data_loaded_for_actionables_view = False # Force reload/check
                 continue
+
             elif nli_command_type == "nli_query":
                 if user_text_input: # Ensure there's a query
                     # Connect managers if not already connected (idempotent)
@@ -888,6 +952,11 @@ async def main_assistant_entry(run_mode: str = "normal"):
                 else:
                     print(f"{user_interface.Fore.YELLOW}Empty NLI query, please type a command.{user_interface.Style.RESET_ALL}")
                 continue # Stay in NLI mode
+
+            else:
+                print(f"{user_interface.Fore.YELLOW}Unknown command. Type a question or use the available commands.{user_interface.Style.RESET_ALL}")
+                continue
+
 
         elif current_mode in ["from_notification", "actionables_from_nli"]:
             if not data_loaded_for_actionables_view:

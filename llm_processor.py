@@ -500,7 +500,7 @@ async def get_llm_tool_call_from_natural_language(
     gemini_client: genai.Client,
     model_name: str,
     user_query: str,
-    active_mcp_sessions_for_llm: List,  # Now can contain MergedMCPSession
+    active_mcp_sessions_for_llm: List[ClientSession],  # Back to raw ClientSession objects
     user_config: Dict[str, Any]
 ) -> Union[str, Dict[str, Any]]:
     print(f"LLM_PROCESSOR (NLI_ToolCall): Getting tool call for query: '{user_query}'")
@@ -510,89 +510,150 @@ async def get_llm_tool_call_from_natural_language(
 
     print(f"LLM_PROCESSOR (NLI_ToolCall): Sending to Gemini with {len(active_mcp_sessions_for_llm)} MCP session(s) as tools.")
 
-    # Enhanced system prompt with tool information
+    # Enhanced system prompt
     user_persona = user_config.get(config_manager.USER_PERSONA_KEY, "a professional")
     user_email = user_config.get(config_manager.USER_EMAIL_KEY, "user")
 
-    # Get tool count from merged session if available
-    tool_count_info = ""
-    if '_merged_session' in user_config:
-        merged_session = user_config['_merged_session']
-        total_tools = len(merged_session.merged_tools)
+    # Get tool info from primary manager
+    tool_info = ""
+    primary_manager = user_config.get('_primary_manager')
+    if primary_manager:
+        tool_count = len(primary_manager.tools)
+        manager_type = 'calendar' if 'calendar' in primary_manager.app_name.lower() else 'gmail'
+        tool_info = f"\n- Currently using {manager_type} session with {tool_count} tools available"
 
-        # Fixed: Access session correctly from managers
-        available_managers = user_config.get('_available_managers', {})
-        gmail_session = available_managers.get('gmail').session if available_managers.get('gmail') else None
-        calendar_session = available_managers.get('calendar').session if available_managers.get('calendar') else None
-
-        gmail_tools = sum(1 for tool in merged_session.tool_routing.keys()
-                         if merged_session.tool_routing[tool] == gmail_session)
-        calendar_tools = sum(1 for tool in merged_session.tool_routing.keys()
-                            if merged_session.tool_routing[tool] == calendar_session)
-
-        tool_count_info = f"\n- Total tools available: {total_tools} (Gmail: {gmail_tools}, Calendar: {calendar_tools})"
-
-    system_prompt = f"""You are MCliPPy, a proactive AI assistant designed to help manage emails and calendar events through Gmail and Google Calendar tools.
+    # Create system prompt that encourages tool usage
+    system_prompt_content = f"""You are MCliPPy, a proactive AI assistant designed to help manage emails and calendar events through Gmail and Google Calendar tools.
 
 Your user is {user_email}, whose role is: {user_persona}
 
 You have access to tools for:
 - Gmail: Reading emails, sending replies, managing threads, searching messages
 - Google Calendar: Creating events, finding free slots, updating/deleting events, managing schedules
-{tool_count_info}
+{tool_info}
 
-You can help with tasks like:
-- Checking emails and calendar events
-- Drafting email replies
-- Scheduling meetings
-- Finding free time slots
-- Managing calendar events
+IMPORTANT: You MUST use the available tools to complete user requests. Do NOT provide text-only responses when tools can help.
 
-Always identify yourself as MCliPpy when asked who you are. Be helpful and proactive in suggesting actions the user might want to take.
+When users ask to:
+- Create calendar events → USE calendar creation tools
+- Check emails → USE email fetching tools
+- Find free time → USE calendar free slot tools
+- Draft replies → USE email reply tools
+
+Always identify yourself as MCliPpy when asked who you are.
 
 User query: {user_query}"""
 
+    # Get conversation history
+    conversation_history = user_config.get('_conversation_history')
+
+    if conversation_history and conversation_history.get_history():
+        # Use conversation history with system context
+        history_contents = conversation_history.get_recent_history(max_exchanges=6)
+
+        # Create system message
+        contents = [genai_types.Content(
+            role="user",
+            parts=[genai_types.Part.from_text(text=f"System: {system_prompt_content}")]
+        )]
+
+        # Add conversation history
+        contents.extend(history_contents)
+
+        print(f"LLM_PROCESSOR (NLI_ToolCall): Using conversation history with {len(history_contents)} previous exchanges")
+    else:
+        # No history - create system prompt with current query
+        contents = [genai_types.Content(
+            role="user",
+            parts=[genai_types.Part.from_text(text=f"{system_prompt_content}\n\nUser query: {user_query}")]
+        )]
+        print(f"LLM_PROCESSOR (NLI_ToolCall): No conversation history, using system prompt + current query")
+
+    # Check if this is a query that should definitely use tools
+    tool_requiring_queries = [
+        "create", "schedule", "event", "calendar", "meeting", "email", "check", "fetch",
+        "reply", "send", "free time", "available", "busy", "slot", "find", "list"
+    ]
+
+    should_force_tool_use = any(keyword in user_query.lower() for keyword in tool_requiring_queries)
+
     try:
-        config = genai_types.GenerateContentConfig(
-            temperature=0.2,
-            tools=active_mcp_sessions_for_llm,  # Contains merged session
-            automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
-            tool_config=genai_types.ToolConfig(
-                function_calling_config=genai_types.FunctionCallingConfig(
-                    mode="AUTO"
+        if should_force_tool_use:
+            print(f"LLM_PROCESSOR (NLI_ToolCall): Query requires tools - using ANY mode to force function calling")
+            config = genai_types.GenerateContentConfig(
+                temperature=0.1,  # Lower temperature for more deterministic tool calls
+                tools=active_mcp_sessions_for_llm,  # Raw ClientSession objects
+                tool_config=genai_types.ToolConfig(
+                    function_calling_config=genai_types.FunctionCallingConfig(
+                        mode="ANY"  # FORCE function calling
+                    )
                 )
             )
-        )
+        else:
+            print(f"LLM_PROCESSOR (NLI_ToolCall): General query - using AUTO mode")
+            config = genai_types.GenerateContentConfig(
+                temperature=0.2,
+                tools=active_mcp_sessions_for_llm,
+                tool_config=genai_types.ToolConfig(
+                    function_calling_config=genai_types.FunctionCallingConfig(
+                        mode="AUTO"
+                    )
+                )
+            )
+
+        print(f"LLM_PROCESSOR (NLI_ToolCall): Making API call with function calling mode: {'ANY' if should_force_tool_use else 'AUTO'}")
 
         response = await gemini_client.aio.models.generate_content(
             model=model_name,
-            contents=[system_prompt],
+            contents=contents,
             config=config
         )
 
+        print(f"LLM_PROCESSOR (NLI_ToolCall): Received response from Gemini")
+
         # Check for function call in the response
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-            for part in response.candidates[0].content.parts:
+            print(f"LLM_PROCESSOR (NLI_ToolCall): Response has {len(response.candidates[0].content.parts)} parts")
+
+            for i, part in enumerate(response.candidates[0].content.parts):
+                print(f"LLM_PROCESSOR (NLI_ToolCall): Part {i}: {type(part).__name__}")
+
                 if hasattr(part, 'function_call') and part.function_call:
-                    print(f"LLM_PROCESSOR (NLI_ToolCall): Gemini suggested function call: {part.function_call.name}")
+                    print(f"LLM_PROCESSOR (NLI_ToolCall): 🔧 Gemini suggested function call: {part.function_call.name}")
+                    print(f"LLM_PROCESSOR (NLI_ToolCall): Function args: {dict(part.function_call.args)}")
                     return {
                         "function_call": part.function_call,
                         "model_response_parts": list(response.candidates[0].content.parts)
                     }
+                elif hasattr(part, 'text') and part.text:
+                    print(f"LLM_PROCESSOR (NLI_ToolCall): Part {i} is text: {part.text[:100]}...")
 
-        print("LLM_PROCESSOR (NLI_ToolCall): Gemini provided a direct text response.")
-        return response.text if response.text else "I'm not sure how to respond to that."
+        print("LLM_PROCESSOR (NLI_ToolCall): Gemini provided a direct text response (no function calls)")
+
+        # If we forced tool use but got no function call, something's wrong
+        if should_force_tool_use:
+            print("LLM_PROCESSOR (NLI_ToolCall): WARNING - Expected function call but got text response!")
+            return "I should be able to help with that using my tools, but I'm having trouble accessing them right now. Can you try rephrasing your request?"
+
+        # Extract text from response
+        response_text = ""
+        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    response_text += part.text
+
+        return response_text if response_text else "I'm not sure how to respond to that."
 
     except Exception as e:
         error_str = str(e)
         print(f"{user_interface.Fore.RED}LLM_PROCESSOR (NLI_ToolCall): Error during Gemini API call: {e}{user_interface.Style.RESET_ALL}")
         traceback.print_exc()
 
-        # Handle specific duplicate tool error
         if "already defined" in error_str:
             return "I'm having trouble with overlapping tool definitions. Let me try to help you in a different way. What specifically would you like me to do?"
 
         return f"Sorry, I encountered an error trying to process your request: {str(e)}"
+
 
 async def get_final_response_after_tool_execution(
     gemini_client: genai.Client,
@@ -601,16 +662,20 @@ async def get_final_response_after_tool_execution(
     previous_model_parts: List[genai_types.Part],
     tool_name: str,
     tool_execution_result: Dict[str, Any],
-    active_mcp_sessions_for_llm: List[ClientSession],  # Changed from List[ClientSession] parameter name
+    active_mcp_sessions_for_llm: List,
     user_config: Dict[str, Any]
 ) -> str:
     print(f"LLM_PROCESSOR (NLI_FinalResp): Getting final response after executing tool '{tool_name}'.")
+
+    # Add system context for tool response
+    user_email = user_config.get(config_manager.USER_EMAIL_KEY, "user")
+    system_context = f"You are MCliPpy, AI assistant for {user_email}. You just executed the tool '{tool_name}' successfully. Provide a helpful summary of what was accomplished."
 
     # Construct the conversation history for Gemini
     history_contents = [
         genai_types.Content(
             role="user",
-            parts=[genai_types.Part.from_text(text=original_user_query)]
+            parts=[genai_types.Part.from_text(text=f"System: {system_context}\n\nOriginal query: {original_user_query}")]
         ),
         genai_types.Content(
             role="model",
@@ -625,12 +690,14 @@ async def get_final_response_after_tool_execution(
         )
     ]
 
-    # For this second call, disable function calling for final response
+    print(f"LLM_PROCESSOR (NLI_FinalResp): Tool result: {str(tool_execution_result)[:200]}...")
+
+    # For this call, disable function calling for final response
     config = genai_types.GenerateContentConfig(
         temperature=0.7,
         tool_config=genai_types.ToolConfig(
             function_calling_config=genai_types.FunctionCallingConfig(
-                mode="NONE"
+                mode="NONE"  # Disable function calling for final summary
             )
         )
     )
@@ -642,23 +709,22 @@ async def get_final_response_after_tool_execution(
             config=config
         )
 
-        return response.text if response.text else "I've processed that, but I don't have anything more to say."
+        final_text = response.text if response.text else "I've processed that, but I don't have anything more to say."
+        print(f"LLM_PROCESSOR (NLI_FinalResp): Generated final response: {final_text[:100]}...")
+        return final_text
 
     except Exception as e:
-        print(f"{user_interface.Fore.RED}LLM_PROCESSOR (NLI_FinalResp): Error during Gemini API call for final response: {e}{user_interface.Style.RESET_ALL}")
+        print(f"{user_interface.Fore.RED}LLM_PROCESSOR (NLI_FinalResp): Error during final response: {e}{user_interface.Style.RESET_ALL}")
         traceback.print_exc()
 
-        # Fallback: try to present the tool result directly if LLM fails to summarize
+        # Fallback: present tool result directly
         if tool_execution_result.get("successful"):
-            success_message = tool_execution_result.get('message')
-            if success_message:
-                return f"Action '{tool_name}' was successful: {success_message}"
-            data_preview = tool_execution_result.get('data', tool_execution_result.get('created_event_data', tool_execution_result.get('free_slots', None)))
-            if data_preview:
-                return f"Action '{tool_name}' was successful. Data: {json.dumps(data_preview, indent=2, default=str)[:200]}..."
-            return f"Action '{tool_name}' was successful."
+            success_message = tool_execution_result.get('message', f"Tool '{tool_name}' executed successfully")
+            return f"✅ {success_message}"
         else:
-            return f"Action '{tool_name}' failed. Error: {tool_execution_result.get('error', 'Unknown error from tool.')}"
+            error_message = tool_execution_result.get('error', 'Unknown error')
+            return f"❌ Tool '{tool_name}' failed: {error_message}"
+
 
 # --- Test Stub (Comprehensive) ---
 
