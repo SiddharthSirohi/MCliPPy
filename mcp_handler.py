@@ -3,6 +3,7 @@ import asyncio
 import json
 import traceback
 import sys
+import time
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from typing import Dict, List, Optional, Any, Tuple
@@ -14,15 +15,12 @@ import calendar_utils
 COMPOSIO_AUTH_INIT_TOOL = "COMPOSIO_INITIATE_CONNECTION"
 
 async def call_composio_initiate_connection(session: ClientSession, app_name: str, user_id_for_logging: str):
-    # (This function remains the same as the one from my previous response that correctly parsed the redirect_url)
-    # ... (ensure it has the robust redirect_url parsing)
     print(f"MCP_HANDLER: Calling {COMPOSIO_AUTH_INIT_TOOL} for app '{app_name}' and user '{user_id_for_logging}'.")
     init_conn_params = {"tool": app_name}
     print(f"  Parameters for {COMPOSIO_AUTH_INIT_TOOL}: {init_conn_params}")
     redirect_url_from_tool = None
     try:
         auth_tool_result = await session.call_tool(COMPOSIO_AUTH_INIT_TOOL, init_conn_params)
-        # print(f"--- Result from {COMPOSIO_AUTH_INIT_TOOL} ---") # Optional debug
         if hasattr(auth_tool_result, 'content') and auth_tool_result.content:
             for item in auth_tool_result.content:
                 text_content = getattr(item, 'text', '')
@@ -39,11 +37,10 @@ async def call_composio_initiate_connection(session: ClientSession, app_name: st
                             print(f"MCP_HANDLER: Error from {COMPOSIO_AUTH_INIT_TOOL}: {data.get('error')}")
                     except json.JSONDecodeError:
                          if "https://backend.composio.dev/api/v3/s/" in text_content:
-                             # Basic extraction if not clean JSON
                              start_index = text_content.find("https://backend.composio.dev/api/v3/s/")
                              if start_index != -1:
-                                 end_index = text_content.find("\"", start_index) # Assuming it's in quotes
-                                 if end_index == -1: end_index = text_content.find(" ", start_index) # Or space
+                                 end_index = text_content.find("\"", start_index)
+                                 if end_index == -1: end_index = text_content.find(" ", start_index)
                                  if end_index == -1: end_index = len(text_content)
                                  redirect_url_from_tool = text_content[start_index:end_index].strip()
                              break
@@ -69,11 +66,21 @@ class McpSessionManager:
         self.full_mcp_url = f"{self.mcp_base_url}&user_id={self.user_id}"
         self._sse_client_cm = None
         self._transport_streams = None
-        self.session: ClientSession | None = None
-        self.tools = {}
+        self.session: Optional[ClientSession] = None
+        self.tools: Dict[str, Any] = {}
+        self._is_connecting = False
+        self._is_connected = False
+        self._last_activity = None
+        self._connection_timeout = 300  # 5 minutes as per MCP SDK
+        self._max_reconnect_attempts = 3
 
-    async def __aenter__(self):
-        # (Same as previous correct version with sys.exc_info())
+
+    async def _connect_session(self):
+        """Internal method to establish the MCP session."""
+        if self._is_connected or self._is_connecting:
+            return
+
+        self._is_connecting = True
         print(f"MCP_SM ({self.app_name}): Connecting to {self.full_mcp_url}")
         try:
             self._sse_client_cm = sse_client(self.full_mcp_url)
@@ -83,26 +90,92 @@ class McpSessionManager:
             print(f"MCP_SM ({self.app_name}): Initializing session...")
             await self.session.initialize()
             print(f"MCP_SM ({self.app_name}): Session initialized.")
-            await self._list_and_cache_tools() # List tools on connect
-            return self
+            await self._list_and_cache_tools()
+            self._is_connected = True
+            self._last_activity = time.time()  # Set initial activity time
         except Exception as e:
-            print(f"MCP_SM ({self.app_name}): Error during __aenter__: {e}")
+            print(f"MCP_SM ({self.app_name}): Error during _connect_session: {e}")
             traceback.print_exc()
             exc_info = sys.exc_info()
-            if self.session: await self.session.__aexit__(*exc_info)
-            if self._sse_client_cm: await self._sse_client_cm.__aexit__(*exc_info)
-            self.session = None # Ensure session is None if setup fails
+            # Clean up partially established resources
+            if self.session and hasattr(self.session, '__aexit__'):
+                try:
+                    await self.session.__aexit__(*exc_info)
+                except Exception as e_exit_session:
+                    print(f"MCP_SM ({self.app_name}): Error during session cleanup: {e_exit_session}")
+            if self._sse_client_cm and hasattr(self._sse_client_cm, '__aexit__'):
+                try:
+                    await self._sse_client_cm.__aexit__(*exc_info)
+                except Exception as e_exit_sse:
+                    print(f"MCP_SM ({self.app_name}): Error during sse_client cleanup: {e_exit_sse}")
+
+            self.session = None
             self._sse_client_cm = None
-            raise
+            self._transport_streams = None
+            self._is_connected = False
+        finally:
+            self._is_connecting = False
+
+    async def ensure_connected(self):
+        """Ensures the MCP session is connected with automatic reconnection."""
+        current_time = time.time()
+
+        # Check if connection is stale (more than 4 minutes old to be safe)
+        if (self._is_connected and self._last_activity and
+            current_time - self._last_activity > 240):  # 4 minutes
+            print(f"MCP_SM ({self.app_name}): Connection appears stale, proactively reconnecting...")
+            await self.disconnect_if_connected()
+
+        if not self._is_connected and not self._is_connecting:
+            await self._connect_session()
+        elif self._is_connecting:
+            # Wait for existing connection attempt
+            wait_count = 0
+            while self._is_connecting and wait_count < 30:  # Max 3 seconds wait
+                await asyncio.sleep(0.1)
+                wait_count += 1
+
+        # Update last activity timestamp
+        if self._is_connected:
+            self._last_activity = current_time
+
+    async def disconnect_if_connected(self):
+        """Disconnects the MCP session if it's currently active."""
+        if self._is_connected and self.session:
+            print(f"MCP_SM ({self.app_name}): Disconnecting session...")
+            try:
+                # Proper cleanup sequence
+                if self.session and hasattr(self.session, '__aexit__'):
+                    await self.session.__aexit__(None, None, None)
+            except Exception as e:
+                print(f"MCP_SM ({self.app_name}): Warning during session cleanup: {e}")
+
+            try:
+                if self._sse_client_cm and hasattr(self._sse_client_cm, '__aexit__'):
+                    await self._sse_client_cm.__aexit__(None, None, None)
+            except Exception as e:
+                print(f"MCP_SM ({self.app_name}): Warning during SSE client cleanup: {e}")
+            finally:
+                # Always reset state
+                self.session = None
+                self._sse_client_cm = None
+                self._transport_streams = None
+                self._is_connected = False
+                self._last_activity = None
+                print(f"MCP_SM ({self.app_name}): Session disconnected.")
+        elif self._is_connecting:
+            print(f"MCP_SM ({self.app_name}): Warning: disconnect_if_connected called while still connecting.")
+
+    async def __aenter__(self):
+        await self.ensure_connected()
+        if not self.session:
+            raise ConnectionError(f"MCP_SM ({self.app_name}): Failed to establish session in __aenter__.")
+        return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # (Same as previous correct version)
-        print(f"MCP_SM ({self.app_name}): Closing session...")
-        if self.session: await self.session.__aexit__(exc_type, exc_val, exc_tb)
-        if self._sse_client_cm: await self._sse_client_cm.__aexit__(exc_type, exc_val, exc_tb)
-        print(f"MCP_SM ({self.app_name}): Session closed.")
+        await self.disconnect_if_connected()
 
-    async def _list_and_cache_tools(self): # Added this method
+    async def _list_and_cache_tools(self):
         if not self.session: return
         print(f"MCP_SM ({self.app_name}): Listing tools...")
         try:
@@ -114,581 +187,303 @@ class McpSessionManager:
             self.tools = {}
 
     async def ensure_auth_and_call_tool(self, tool_name: str, params: dict):
-        if not self.session:
-            print(f"MCP_SM ({self.app_name}): No active session for tool '{tool_name}'. Cannot proceed.")
-            return {"error": f"No active MCP session for {self.app_name}.", "needs_reconnect": True}
+        """Enhanced tool calling with automatic reconnection on failure."""
+        for attempt in range(self._max_reconnect_attempts):
+            try:
+                await self.ensure_connected()
+                if not self.session:
+                    print(f"MCP_SM ({self.app_name}): No active session for tool '{tool_name}'. Cannot proceed (connection failed).")
+                    return {"error": f"No active MCP session for {self.app_name} (connection failed).", "needs_reconnect": True, "successful": False}
 
-        print(f"MCP_SM ({self.app_name}): Attempting to call tool '{tool_name}' with params {params}...")
-        print(f"MCP_SM ({self.app_name}): FINAL PARAMS BEING SENT TO SDK's call_tool for '{tool_name}': {json.dumps(params, indent=2)}") # ADD THIS LINE
-        try:
-            tool_result = await self.session.call_tool(tool_name, params)
+                print(f"MCP_SM ({self.app_name}): Attempting to call tool '{tool_name}' (attempt {attempt + 1}/{self._max_reconnect_attempts})...")
 
-            if hasattr(tool_result, 'content') and tool_result.content:
-                            first_content_item_text = getattr(tool_result.content[0], 'text', None) # Ensure default is None
-                            data = None # Initialize data
-                            if first_content_item_text:
-                                try:
-                                    data = json.loads(first_content_item_text)
-                                except json.JSONDecodeError:
-                                    print(f"MCP_SM ({self.app_name}): Content text is not valid JSON: {first_content_item_text[:100]}...")
-                                    pass # data remains None or previous value
+                # Update activity timestamp before making the call
+                self._last_activity = time.time()
 
-                            if isinstance(data, dict): # Only proceed if data is a dictionary
-                                error_message = data.get("error", "") # error_message will be a string
-                                is_successful_false = data.get("successful") is False
+                tool_result = await self.session.call_tool(tool_name, params)
 
-                                connection_not_found_err = f"Could not find a connection with app='{self.app_name}' and entity='{self.user_id}'"
-                                refresh_token_err_substring = "credentials do not contain the necessary fields need to refresh the access token"
-                                google_401_err_substring = "401 Client Error: Unauthorized for url: https://www.googleapis.com"
+                # Process successful result (your existing logic)
+                if hasattr(tool_result, 'content') and tool_result.content:
+                    first_content_item_text = getattr(tool_result.content[0], 'text', None)
+                    data = None
+                    if first_content_item_text:
+                        try:
+                            data = json.loads(first_content_item_text)
+                        except json.JSONDecodeError:
+                            print(f"MCP_SM ({self.app_name}): Content text is not valid JSON: {first_content_item_text[:100]}...")
+                            return {"error": "Tool response content is not valid JSON.", "successful": False}
 
-                                # Ensure error_message is not None before 'in' check, though get with default "" should handle this.
-                                # For extra safety:
-                                if error_message is None: error_message = ""
+                    if isinstance(data, dict):
+                        error_message = data.get("error")
+                        is_successful_false = data.get("successful") is False
+                        connection_not_found_err = f"Could not find a connection with app='{self.app_name}' and entity='{self.user_id}'"
 
-                                if error_message == connection_not_found_err \
-                                   or refresh_token_err_substring in error_message \
-                                   or (is_successful_false and google_401_err_substring in error_message):
+                        # Fixed None handling
+                        if error_message and (
+                            error_message == connection_not_found_err or
+                            "credentials do not contain the necessary fields" in str(error_message) or
+                            (is_successful_false and "401 Client Error: Unauthorized" in str(error_message))
+                        ):
+                            print(f"MCP_SM ({self.app_name}): Auth needed for '{tool_name}'. Initiating connection process.")
+                            redirect_url = await call_composio_initiate_connection(self.session, self.app_name, self.user_id)
+                            if redirect_url:
+                                return {"error": f"Authentication required for {self.app_name}.", "redirect_url": redirect_url, "needs_user_action": True, "successful": False}
+                            else:
+                                return {"error": f"Auth initiation for {self.app_name} called, but no redirect URL obtained.", "needs_user_action": False, "auth_initiation_failed": True, "successful": False}
+                        elif is_successful_false and error_message:
+                            print(f"MCP_SM ({self.app_name}): Composio error during '{tool_name}' call: {error_message}")
+                            return {"error": f"Composio error for {self.app_name}: {error_message}", "composio_error": True, "successful": False}
 
-                                    print(f"MCP_SM ({self.app_name}): Auth needed or refresh/API call failed for '{tool_name}'. Error snippet: '{error_message[:100]}...'. Initiating connection process.")
-                                    redirect_url = await call_composio_initiate_connection(self.session, self.app_name, self.user_id)
-                                    # ... (rest of the auth initiation logic) ...
-                                    if redirect_url:
-                                        return {"error": f"Authentication required for {self.app_name}.", "redirect_url": redirect_url, "needs_user_action": True}
-                                    else:
-                                        return {"error": f"Auth initiation for {self.app_name} called, but no redirect URL obtained.", "needs_user_action": False, "auth_initiation_failed": True}
-                                elif is_successful_false and error_message: # Other Composio reported error
-                                    print(f"MCP_SM ({self.app_name}): Composio error during '{tool_name}' call: {error_message}")
-                                    return {"error": f"Composio error for {self.app_name}: {error_message}", "composio_error": True}
+                    return tool_result
 
-                        # If no specific auth/Composio error detected in content, assume it's a valid tool result
-                            return tool_result
+                print(f"MCP_SM ({self.app_name}): Tool '{tool_name}' call returned no content or unexpected structure.")
+                return {"error": f"Tool '{tool_name}' call returned no content or unexpected structure.", "successful": False}
 
-        except Exception as e:
-            print(f"MCP_SM ({self.app_name}): Exception calling tool '{tool_name}': {e}")
-            traceback.print_exc()
-            # Check if it's a known MCP error that might indicate auth issue, though less likely here
-            if "Method not found" in str(e) and COMPOSIO_AUTH_INIT_TOOL in str(e): # Highly unlikely
-                 print(f"MCP_SM ({self.app_name}): Auth tool itself not found, check MCP server config.")
-            return {"error": str(e), "exception": True}
+            except Exception as e:
+                error_msg = str(e)
+                print(f"MCP_SM ({self.app_name}): Exception calling tool '{tool_name}' (attempt {attempt + 1}): {error_msg}")
 
+                # Check if it's a connection error that we can retry
+                if "Connection closed" in error_msg or "Connection lost" in error_msg:
+                    if attempt < self._max_reconnect_attempts - 1:
+                        print(f"MCP_SM ({self.app_name}): Connection error, attempting reconnection...")
+                        await self.disconnect_if_connected()
+                        await asyncio.sleep(1)  # Brief delay before retry
+                        continue
+                    else:
+                        print(f"MCP_SM ({self.app_name}): Max reconnection attempts reached for '{tool_name}'")
+                        return {"error": f"Connection failed after {self._max_reconnect_attempts} attempts: {error_msg}", "connection_failed": True, "successful": False}
+                else:
+                    # Non-connection error, don't retry
+                    traceback.print_exc()
+                    return {"error": str(e), "exception": True, "successful": False}
+
+        return {"error": f"Tool execution failed after {self._max_reconnect_attempts} attempts", "max_attempts_reached": True, "successful": False}
+    # --- get_calendar_free_slots ---
     async def get_calendar_free_slots(
         self,
-        time_min_iso_ist: str,    # e.g., "2025-06-02T09:00:00+05:30"
-        time_max_iso_ist: str,    # e.g., "2025-06-02T18:00:00+05:30"
+        time_min_iso_ist: str,
+        time_max_iso_ist: str,
         meeting_duration_minutes: int,
         user_work_start_hour: int,
         user_work_end_hour: int,
         calendar_id: str = "primary"
     ) -> Dict[str, Any]:
-        """
-        Calls Composio's GOOGLECALENDAR_FIND_FREE_SLOTS, then uses calendar_utils
-        to calculate and return a list of free slots.
-        Returns {"successful": True, "free_slots": list_of_slots} or
-                {"successful": False, "error": "message"}
-        Each slot in list_of_slots is a dict: {"start": "iso_str_ist", "end": "iso_str_ist"}
-        """
+        await self.ensure_connected()
         if not self.session:
-            return {"error": "No active Calendar MCP session.", "successful": False}
+            return {"error": "No active Calendar MCP session (connection failed).", "successful": False}
 
         tool_name = "GOOGLECALENDAR_FIND_FREE_SLOTS"
         if tool_name not in self.tools:
-            msg = f"Tool '{tool_name}' not available in cached tools. Check Composio allowed_tools."
+            msg = f"Tool '{tool_name}' not available. Check Composio allowed_tools."
             print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg}{user_interface.Style.RESET_ALL}")
             return {"error": msg, "successful": False}
 
         params = {
-            "time_min": time_min_iso_ist,
-            "time_max": time_max_iso_ist,
-            "timezone": "Asia/Kolkata", # Hardcoded as per requirement
-            "items": [calendar_id], # List containing the calendar ID, usually "primary"
-            "calendar_expansion_max": 1, # As per your successful payload
-            "group_expansion_max": 0     # As per your successful payload
+            "time_min": time_min_iso_ist, "time_max": time_max_iso_ist,
+            "timezone": "Asia/Kolkata", "items": [calendar_id],
+            "calendar_expansion_max": 1, "group_expansion_max": 0
         }
-
-        print(f"MCP_SM ({self.app_name}): Attempting to call '{tool_name}' with params: {params}")
 
         find_slots_outcome = await self.ensure_auth_and_call_tool(tool_name, params)
 
-        # Debug print for the raw outcome
-        print(f"MCP_SM ({self.app_name}): Raw outcome from {tool_name}:")
-        if isinstance(find_slots_outcome, dict):
-            print(json.dumps(find_slots_outcome, indent=2))
-        elif find_slots_outcome and hasattr(find_slots_outcome, 'content'):
-            print(f"  ToolCallResult.content: {find_slots_outcome.content}")
-            if find_slots_outcome.content and hasattr(find_slots_outcome.content[0], 'text'):
-                print(f"  First content item text: {getattr(find_slots_outcome.content[0], 'text', None)}")
-        else:
-            print(f"  Outcome was None or unexpected structure: {find_slots_outcome}")
-
-
-        # 1. Handle direct error dicts from ensure_auth_and_call_tool
         if isinstance(find_slots_outcome, dict) and find_slots_outcome.get("error"):
             return find_slots_outcome
 
-        # 2. Process ToolCallResult
         if find_slots_outcome and hasattr(find_slots_outcome, 'content') and find_slots_outcome.content:
             text_content = getattr(find_slots_outcome.content[0], 'text', None)
             if text_content:
                 try:
                     composio_response = json.loads(text_content)
-                    print(f"DEBUG_MCP_HANDLER (FindFreeSlots): Composio_response received.")
-
-                    if composio_response.get("successful") is True:
+                    if composio_response.get("successful"):
                         response_data = composio_response.get("data", {}).get("response_data", {})
-                        busy_slots_for_calendar = response_data.get("calendars", {}).get(calendar_id, {}).get("busy", [])
-
+                        busy_slots = response_data.get("calendars", {}).get(calendar_id, {}).get("busy", [])
                         query_start_dt = calendar_utils.parse_iso_to_ist(time_min_iso_ist)
                         query_end_dt = calendar_utils.parse_iso_to_ist(time_max_iso_ist)
-
                         if not query_start_dt or not query_end_dt:
-                            msg = "Invalid time_min or time_max provided for free slot calculation."
-                            print(f"{user_interface.Fore.RED}{msg}{user_interface.Style.RESET_ALL}")
-                            return {"successful": False, "error": msg}
+                            return {"successful": False, "error": "Invalid time_min/max for free slot calc."}
 
                         free_slots = calendar_utils.calculate_free_slots(
-                            query_start_dt_ist=query_start_dt,
-                            query_end_dt_ist=query_end_dt,
-                            busy_slots_data=busy_slots_for_calendar,
-                            meeting_duration_minutes=meeting_duration_minutes,
-                            workday_start_hour=user_work_start_hour,
-                            workday_end_hour=user_work_end_hour                            # workday_start_hour and workday_end_hour use defaults from calendar_utils
+                            query_start_dt, query_end_dt, busy_slots,
+                            meeting_duration_minutes, user_work_start_hour, user_work_end_hour
                         )
-                        print(f"{user_interface.Fore.GREEN}Successfully found {len(free_slots)} free slot(s).{user_interface.Style.RESET_ALL}")
                         return {"successful": True, "free_slots": free_slots}
-
-                    elif composio_response.get("successful") is False and composio_response.get("error") is not None:
-                        error_msg = str(composio_response.get("error"))
-                        print(f"{user_interface.Fore.RED}Composio tool '{tool_name}' reported failure: {error_msg}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": error_msg, "composio_reported_error": True}
                     else:
-                        msg = f"Composio response for {tool_name} did not indicate clear success or provide a specific error."
-                        print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {msg} Response: {json.dumps(composio_response, indent=2)}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": msg}
-
+                        err = composio_response.get("error", "Composio tool reported not successful.")
+                        return {"successful": False, "error": str(err), "composio_reported_error": True}
                 except json.JSONDecodeError:
-                    msg = f"Could not parse {tool_name} JSON response."
-                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg} Raw: {text_content[:200]}...{user_interface.Style.RESET_ALL}")
-                    return {"successful": False, "error": msg}
+                    return {"successful": False, "error": f"Could not parse {tool_name} JSON response."}
             else:
-                msg = f"No text content in {tool_name} response item."
-                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {msg}{user_interface.Style.RESET_ALL}")
-                return {"successful": False, "error": msg}
+                return {"successful": False, "error": f"No text content in {tool_name} response."}
 
-        # 3. Fallback
-        msg = f"Unexpected result structure from {tool_name} after tool call."
-        print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg} Raw: {find_slots_outcome}{user_interface.Style.RESET_ALL}")
-        return {"successful": False, "error": msg}
+        return {"successful": False, "error": f"Unexpected result from {tool_name} tool call."}
 
-
-    async def reply_to_gmail_thread(
-        self,
-        thread_id: str,
-        recipient_email: str, # This is the original sender
-        message_body: str,
-        # cc_emails: Optional[List[str]] = None, # Future enhancement
-        # bcc_emails: Optional[List[str]] = None  # Future enhancement
-    ) -> Dict[str, Any]:
-        """
-        Uses Composio's GMAIL_REPLY_TO_THREAD tool (assuming this is the slug).
-        Returns a dictionary with success/error.
-        """
+    # --- reply_to_gmail_thread ---
+    async def reply_to_gmail_thread(self, thread_id: str, recipient_email: str, message_body: str) -> Dict[str, Any]:
+        await self.ensure_connected()
         if not self.session:
-            return {"error": "No active Gmail MCP session.", "successful": False}
+            return {"error": "No active Gmail MCP session (connection failed).", "successful": False}
 
-        # PM: We need to confirm the exact slug for "Action to reply to an email thread in gmail"
-        # Let's assume it's 'GMAIL_REPLY_TO_THREAD' for now.
-        # This should be fetched from self.tools ideally or confirmed from Composio dashboard.
-        tool_name = "GMAIL_REPLY_TO_THREAD" # Placeholder - VERIFY THIS SLUG!
-
-        # Check if this tool is actually available from the list fetched from Composio
+        tool_name = "GMAIL_REPLY_TO_THREAD"
         if tool_name not in self.tools:
-            # Fallback or error if direct reply tool isn't available
-            # For now, let's try to create a draft as a fallback if reply tool is missing.
-            # This shows resilience, a good PM trait.
-            print(f"{user_interface.Fore.YELLOW}MCP_SM (gmail): Tool '{tool_name}' not found. Attempting to create a draft instead.{user_interface.Style.RESET_ALL}")
-            # We need subject for create_draft. We can try to get it or just use a generic one.
-            # For simplicity, let's say draft creation for reply also needs the original subject.
-            # This part would need the original subject if we go the draft route.
-            # For now, let's just signal that direct reply isn't available.
-            return {
-                "error": f"Tool '{tool_name}' not available. Direct reply failed. Consider implementing 'Save as Draft'.",
-                "successful": False
-            }
+            return {"error": f"Tool '{tool_name}' not available.", "successful": False}
 
-
-        params = {
-            "thread_id": thread_id,
-            "recipient_email": recipient_email, # The original sender becomes the recipient of the reply
-            "message_body": message_body,
-            "is_html": False # Assuming plain text
-            # "user_id": "me" # Defaults to "me"
-        }
-        # if cc_emails: params["cc"] = cc_emails
-        # if bcc_emails: params["bcc"] = bcc_emails
-
-        print(f"MCP_SM (gmail): Attempting to call tool '{tool_name}' with"
-              f" ThreadID='{thread_id}', Recipient='{recipient_email}'")
-
-        reply_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, params)
-
-        if isinstance(reply_result_from_mcp, dict) and reply_result_from_mcp.get("needs_user_action"):
-            return reply_result_from_mcp
-        if isinstance(reply_result_from_mcp, dict) and reply_result_from_mcp.get("error"):
-            return {
-                "error": reply_result_from_mcp.get("error", f"Unknown error calling {tool_name}"),
-                "successful": False,
-                "needs_user_action": reply_result_from_mcp.get("needs_user_action", False)
-            }
-
-        if reply_result_from_mcp and hasattr(reply_result_from_mcp, 'content') and reply_result_from_mcp.content:
-            text_content = getattr(reply_result_from_mcp.content[0], 'text', None)
-            if text_content:
-                try:
-                    composio_response = json.loads(text_content)
-                    if composio_response.get("successful"):
-                        # The "data" from "reply to thread" might not have a specific ID like a draft,
-                        # but it indicates success.
-                        print(f"{user_interface.Fore.GREEN}Successfully replied to Gmail thread (Thread ID: {thread_id}).{user_interface.Style.RESET_ALL}")
-                        return {"successful": True, "message": f"Successfully replied to thread ID: {thread_id}."}
-                    else:
-                        error_msg = composio_response.get("error", f"Failed to reply to thread, Composio tool reported not successful.")
-                        print(f"{user_interface.Fore.RED}{error_msg}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": error_msg}
-                except json.JSONDecodeError:
-                    return {"successful": False, "error": f"Could not parse {tool_name} response from Composio."}
-
-        return {"successful": False, "error": f"Unexpected or empty response from {tool_name}."}
-
-    async def mark_thread_as_read(self, thread_id: str) -> Dict[str, Any]: # Renamed method, takes thread_id
-        """
-        Marks an entire email thread as read by removing the 'UNREAD' label from it.
-        Uses Composio's GMAIL_MODIFY_THREAD_LABELS tool.
-        """
-        if not self.session:
-            return {"error": "No active Gmail MCP session.", "successful": False}
-
-        tool_name = "GMAIL_MODIFY_THREAD_LABELS" # <<< CHANGED TOOL SLUG
-
-        if tool_name not in self.tools:
-            msg = f"Tool '{tool_name}' not available. Ensure it's in Composio allowed_tools."
-            print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg}{user_interface.Style.RESET_ALL}")
-            return {"error": msg, "successful": False}
-
-        params = {
-            "thread_id": thread_id, # <<< CHANGED from message_id
-            "remove_label_ids": ["UNREAD"]
-            # "user_id": "me" # Defaults to "me"
-        }
-
-        print(f"MCP_SM ({self.app_name}): Attempting to mark thread ID '{thread_id}' as read using '{tool_name}'.")
-
+        params = {"thread_id": thread_id, "recipient_email": recipient_email, "message_body": message_body, "is_html": False}
         outcome = await self.ensure_auth_and_call_tool(tool_name, params)
 
-
-        # --- Standard Parsing Logic for Composio's Response ---
-        print(f"MCP_SM ({self.app_name}): Raw outcome from {tool_name} for thread {thread_id}:")
-        if isinstance(outcome, dict): print(json.dumps(outcome, indent=2))
-        elif outcome and hasattr(outcome, 'content'):
-            print(f"  ToolCallResult.content: {outcome.content}")
-            if outcome.content and hasattr(outcome.content[0], 'text'):
-                print(f"  First content item text: {getattr(outcome.content[0], 'text', None)}")
-        else: print(f"  Outcome was None or unexpected: {outcome}")
-
-
-        if isinstance(outcome, dict) and outcome.get("error"): # Handles needs_user_action and other errors from ensure_auth_and_call_tool
+        if isinstance(outcome, dict) and outcome.get("error"):
             return outcome
-
         if outcome and hasattr(outcome, 'content') and outcome.content:
             text_content = getattr(outcome.content[0], 'text', None)
             if text_content:
                 try:
-                    composio_response = json.loads(text_content)
-                    print(f"DEBUG_MCP_HANDLER (MarkThreadAsRead): Parsed composio_response: {json.dumps(composio_response, indent=2)}")
-
-                    if composio_response.get("successful") is True:
-                        # Google's threads.modify API returns the modified thread resource.
-                        modified_thread_data = composio_response.get("data", {}).get("response_data", {})
-                        print(f"{user_interface.Fore.GREEN}Successfully marked thread ID '{thread_id}' as read.{user_interface.Style.RESET_ALL}")
-                        return {"successful": True, "message": f"Thread {thread_id} marked as read.", "modified_thread_data": modified_thread_data}
-
-                    elif composio_response.get("successful") is False and composio_response.get("error") is not None:
-                        error_msg = str(composio_response.get("error"))
-                        print(f"{user_interface.Fore.RED}Composio tool '{tool_name}' (thread {thread_id}) reported failure: {error_msg}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": error_msg, "composio_reported_error": True}
+                    res = json.loads(text_content)
+                    if res.get("successful"):
+                        return {"successful": True, "message": f"Replied to thread {thread_id}."}
                     else:
-                        msg = f"Composio response for {tool_name} (thread {thread_id}) unclear."
-                        print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {msg} Response: {json.dumps(composio_response, indent=2)}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": msg}
+                        return {"successful": False, "error": res.get("error", "Gmail reply failed.")}
                 except json.JSONDecodeError:
-                    msg = f"Could not parse {tool_name} JSON response for thread {thread_id}."
-                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg} Raw: {text_content[:200]}...{user_interface.Style.RESET_ALL}")
-                    return {"successful": False, "error": msg}
-            else:
-                msg = f"No text content in {tool_name} response item for thread {thread_id}."
-                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {msg}{user_interface.Style.RESET_ALL}")
-                return {"successful": False, "error": msg}
+                    return {"successful": False, "error": "Could not parse reply response."}
+        return {"successful": False, "error": f"Unexpected response from {tool_name}."}
 
-        msg = f"Unhandled result structure from {tool_name} for thread {thread_id}."
-        print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): {msg} Raw: {outcome}{user_interface.Style.RESET_ALL}")
-        return {"successful": False, "error": msg}
-
-    async def delete_calendar_event(self, event_id: str, calendar_id: str = "primary") -> Dict[str, Any]:
-        """
-        Uses Composio's GOOGLECALENDAR_DELETE_EVENT tool.
-        Returns a dictionary with success/error.
-        """
+    # --- mark_thread_as_read ---
+    async def mark_thread_as_read(self, thread_id: str) -> Dict[str, Any]:
+        await self.ensure_connected()
         if not self.session:
-            return {"error": "No active Calendar MCP session.", "successful": False}
+            return {"error": "No active Gmail MCP session (connection failed).", "successful": False}
 
-        tool_name = "GOOGLECALENDAR_DELETE_EVENT" # Confirm this slug from your allowed_tools
-
+        tool_name = "GMAIL_MODIFY_THREAD_LABELS"
         if tool_name not in self.tools:
-            print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Tool '{tool_name}' not available in cached tools.{user_interface.Style.RESET_ALL}")
             return {"error": f"Tool '{tool_name}' not available.", "successful": False}
 
-        params = {
-            "event_id": event_id,
-            "calendar_id": calendar_id # Composio schema showed this, defaults to primary if not sent
-        }
+        params = {"thread_id": thread_id, "remove_label_ids": ["UNREAD"]}
+        outcome = await self.ensure_auth_and_call_tool(tool_name, params)
 
-        print(f"MCP_SM ({self.app_name}): Attempting to call tool '{tool_name}' with EventID='{event_id}', CalendarID='{calendar_id}'")
-
-        delete_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, params)
-
-        if isinstance(delete_result_from_mcp, dict) and delete_result_from_mcp.get("needs_user_action"):
-            return delete_result_from_mcp # Propagate auth requirement
-        if isinstance(delete_result_from_mcp, dict) and delete_result_from_mcp.get("error"):
-            return {
-                "error": delete_result_from_mcp.get("error", f"Unknown error calling {tool_name}"),
-                "successful": False,
-                "needs_user_action": delete_result_from_mcp.get("needs_user_action", False)
-            }
-
-        # Google Calendar API delete operation usually returns an empty response (204 No Content) on success.
-        # We need to see how Composio's tool wraps this.
-        # Let's assume Composio's JSON wrapper will have a "successful: true" field.
-        if delete_result_from_mcp and hasattr(delete_result_from_mcp, 'content') and delete_result_from_mcp.content:
-            text_content = getattr(delete_result_from_mcp.content[0], 'text', None)
+        if isinstance(outcome, dict) and outcome.get("error"):
+            return outcome
+        if outcome and hasattr(outcome, 'content') and outcome.content:
+            text_content = getattr(outcome.content[0], 'text', None)
             if text_content:
                 try:
-                    composio_response = json.loads(text_content)
-                    if composio_response.get("successful"):
-                        print(f"{user_interface.Fore.GREEN}Successfully deleted Calendar event (ID: {event_id}).{user_interface.Style.RESET_ALL}")
-                        return {"successful": True, "message": f"Event ID: {event_id} deleted."}
+                    res = json.loads(text_content)
+                    if res.get("successful"):
+                        return {"successful": True, "message": f"Thread {thread_id} marked as read."}
                     else:
-                        error_msg = composio_response.get("error", f"Failed to delete event, Composio tool reported not successful.")
-                        print(f"{user_interface.Fore.RED}{error_msg}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": error_msg}
+                        return {"successful": False, "error": res.get("error", "Mark read failed.")}
                 except json.JSONDecodeError:
-                    # Sometimes a successful delete might not return JSON body from the tool,
-                    # or Composio might wrap a 204 differently.
-                    # If no JSON, but no prior error, we might infer success.
-                    # However, it's safer to expect Composio's wrapper.
-                    print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Could not parse {tool_name} response from Composio, but no explicit error from tool call. Raw text: '{text_content[:100]}...'{user_interface.Style.RESET_ALL}")
-                    # Let's assume for now an unparseable response without an MCP error is a problem.
-                    return {"successful": False, "error": f"Could not parse {tool_name} response."}
-        elif delete_result_from_mcp and not hasattr(delete_result_from_mcp, 'isError'):
-            # It might be a ToolCallResult with no content and no isError (for 204)
-            # The Composio tool might just return successful:true even with no other data.
-            # This part is a bit speculative without seeing Composio's exact wrapper for a 204.
-            # The ensure_auth_and_call_tool should ideally return a dict with "successful":True if composio does.
-            # Let's assume if we reach here and it's not an error dict from ensure_auth_and_call_tool, it might have worked.
-            # This logic relies on ensure_auth_and_call_tool correctly parsing Composio's success envelope.
-             print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): {tool_name} call returned no content, assuming success if no prior error.{user_interface.Style.RESET_ALL}")
-             return {"successful": True, "message": f"Event ID: {event_id} likely deleted (no content in response)."}
+                    return {"successful": False, "error": "Could not parse mark read response."}
+        return {"successful": False, "error": f"Unexpected response from {tool_name}."}
 
-
-        return {"successful": False, "error": f"Unexpected or empty response from {tool_name} after checking content."}
-
-    async def update_calendar_event(self, event_id: str, calendar_id: str = "primary", updates: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        Uses Composio's GOOGLECALENDAR_UPDATE_EVENT tool.
-        'updates' dict should contain fields to change, e.g.,
-        {"summary": "New Title", "start_datetime": "2025-06-01T10:00:00", "timezone": "Asia/Kolkata"}
-        """
+    # --- create_calendar_event ---
+    async def create_calendar_event(self, event_details: Dict[str, Any]) -> Dict[str, Any]:
+        await self.ensure_connected()
         if not self.session:
-            return {"error": "No active Calendar MCP session.", "successful": False}
-
-        tool_name = "GOOGLECALENDAR_UPDATE_EVENT"
-        if tool_name not in self.tools:
-            print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Tool '{tool_name}' not available.{user_interface.Style.RESET_ALL}")
-            return {"error": f"Tool '{tool_name}' not available.", "successful": False}
-
-        if not updates: # If no updates provided, nothing to do
-            return {"error": "No updates provided for the event.", "successful": False}
-
-        params = {"event_id": event_id, "calendar_id": calendar_id}
-        valid_update_keys = [
-                    "summary", "start_datetime", "event_duration_hour", "event_duration_minutes",
-                    "description", "location", "attendees", "create_meeting_room", "timezone",
-                    "transparency", "visibility", "guests_can_modify", "guestsCanInviteOthers", "guestsCanSeeOtherGuests",
-                    "recurrence" # Add other valid keys from the CSV as needed
-                ]
-
-        actual_params_to_send = params.copy() # Start with event_id and calendar_id
-        for key, value in updates.items():
-            if key in valid_update_keys:
-                actual_params_to_send[key] = value
-            else:
-                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Ignoring unknown update key '{key}' for tool '{tool_name}'.{user_interface.Style.RESET_ALL}")
-
-        # Remove event_id and calendar_id from 'updates' dict for cleaner logging of just changes
-        updates_for_logging = {k:v for k,v in actual_params_to_send.items() if k not in ['event_id', 'calendar_id']}
-
-
-            # Parameter sanity checks based on CSV
-        if "start_datetime" in actual_params_to_send:
-                if not isinstance(actual_params_to_send["start_datetime"], str) or "T" not in actual_params_to_send["start_datetime"]:
-                     print(f"{user_interface.Fore.RED}Error: start_datetime for update must be YYYY-MM-DDTHH:MM:SS, got {actual_params_to_send['start_datetime']}{user_interface.Style.RESET_ALL}")
-                     return {"error": "start_datetime must be YYYY-MM-DDTHH:MM:SS", "successful": False}
-        if "event_duration_minutes" in actual_params_to_send:
-            try:
-                minutes = int(actual_params_to_send["event_duration_minutes"])
-                if not (0 <= minutes <= 59): # Schema said 0-59
-                    print(f"{user_interface.Fore.RED}Error: event_duration_minutes must be 0-59, got {minutes}{user_interface.Style.RESET_ALL}")
-                    return {"error": "event_duration_minutes must be 0-59", "successful": False}
-            except ValueError:
-                print(f"{user_interface.Fore.RED}Error: event_duration_minutes must be an integer, got {actual_params_to_send['event_duration_minutes']}{user_interface.Style.RESET_ALL}")
-                return {"error": "event_duration_minutes must be an integer", "successful": False}
-
-        if "event_duration_hour" in actual_params_to_send:
-            try:
-                hours = int(actual_params_to_send["event_duration_hour"])
-                if not (0 <= hours <= 23): # Schema implied 0-24, but 24h usually means next day start. 0-23 is safer for duration part.
-                    print(f"{user_interface.Fore.RED}Error: event_duration_hour must be 0-23, got {hours}{user_interface.Style.RESET_ALL}")
-                    return {"error": "event_duration_hour must be 0-23", "successful": False}
-            except ValueError:
-                print(f"{user_interface.Fore.RED}Error: event_duration_hour must be an integer, got {actual_params_to_send['event_duration_hour']}{user_interface.Style.RESET_ALL}")
-                return {"error": "event_duration_hour must be an integer", "successful": False}
-           # Add more checks as needed
-
-        print(f"MCP_SM ({self.app_name}): Attempting to call '{tool_name}' for EventID='{event_id}' with updates: {updates_for_logging}")
-        tool_call_outcome = await self.ensure_auth_and_call_tool(tool_name, actual_params_to_send)
-
-        # --- NEW SIMPLIFIED PARSING ---
-        print(f"MCP_SM ({self.app_name}): Raw tool_call_outcome for {tool_name}:") # Keep this debug
-        if isinstance(tool_call_outcome, dict):
-            print(json.dumps(tool_call_outcome, indent=2))
-        elif tool_call_outcome and hasattr(tool_call_outcome, 'content'):
-            print(f"  ToolCallResult.content: {tool_call_outcome.content}")
-            if tool_call_outcome.content and hasattr(tool_call_outcome.content[0], 'text'):
-                print(f"  First content item text: {getattr(tool_call_outcome.content[0], 'text', None)}")
-       # --- END DEBUGGING BLOCK ---
-
-        # 1. Handle direct error dicts from ensure_auth_and_call_tool
-        if isinstance(tool_call_outcome, dict) and tool_call_outcome.get("error"):
-            print(f"DEBUG_MCP_HANDLER: Returning error directly from ensure_auth_and_call_tool: {tool_call_outcome.get('error')}")
-            return tool_call_outcome # This already has "successful": False (implicitly or explicitly) if it's an error
-
-        # 2. Process ToolCallResult if it's not an error dict
-        if tool_call_outcome and hasattr(tool_call_outcome, 'content') and tool_call_outcome.content:
-            text_content = getattr(tool_call_outcome.content[0], 'text', None)
-            if text_content:
-                try:
-                    composio_response = json.loads(text_content)
-                    print(f"DEBUG_MCP_HANDLER: Parsed composio_response: {json.dumps(composio_response, indent=2)}")
-
-                    if composio_response.get("successful") is True:
-                        print(f"DEBUG_MCP_HANDLER: Composio reported success.")
-                        response_data = composio_response.get("data", {}).get("response_data", {}) # For update/fetch
-                        if not response_data and tool_name == "GOOGLECALENDAR_DELETE_EVENT": # Delete might have empty response_data
-                            response_data = {"message": "Delete operation reported successful by Composio."}
-
-                        print(f"{user_interface.Fore.GREEN}Successfully executed {tool_name} for event (ID: {event_id}).{user_interface.Style.RESET_ALL}")
-                        return {"successful": True, "message": f"Tool {tool_name} successful for event ID: {event_id}.", "response_data": response_data}
-
-                    elif composio_response.get("successful") is False and composio_response.get("error") is not None:
-                        error_msg = str(composio_response.get("error"))
-                        print(f"{user_interface.Fore.RED}Composio tool '{tool_name}' reported failure: {error_msg}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": error_msg, "composio_reported_error": True}
-
-                    else: # "successful" key not True, or missing, or False without an "error" field
-                        print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Composio response for {tool_name} unclear: {json.dumps(composio_response, indent=2)}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": f"Composio response for {tool_name} did not indicate clear success or provide a specific error."}
-
-                except json.JSONDecodeError:
-                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): JSONDecodeError parsing {tool_name} response: {text_content[:200]}...{user_interface.Style.RESET_ALL}")
-                    return {"successful": False, "error": f"Could not parse {tool_name} JSON response."}
-            else: # text_content is None or empty
-                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): No text_content in {tool_name} response item.{user_interface.Style.RESET_ALL}")
-                return {"successful": False, "error": f"No text content in {tool_name} response item."}
-
-        # 3. Fallback: If tool_call_outcome is not an error dict and not a ToolCallResult with parseable content
-        print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Unhandled result structure from {tool_name}. Raw: {tool_call_outcome}{user_interface.Style.RESET_ALL}")
-        return {"successful": False, "error": f"Unexpected result structure from {tool_name} after tool call."}
-
-    async def create_calendar_event(self, event_details: Dict[str, Any], calendar_id: str = "primary") -> Dict[str, Any]:
-        """
-        Uses Composio's GOOGLECALENDAR_CREATE_EVENT tool.
-        event_details should contain: summary, start_datetime, timezone,
-                                   event_duration_hour, event_duration_minutes,
-                                   and optional: attendees (list of str), description, location, create_meeting_room
-        """
-        if not self.session:
-            return {"error": "No active Calendar MCP session.", "successful": False}
+            return {"error": "No active Calendar MCP session (connection failed).", "successful": False}
 
         tool_name = "GOOGLECALENDAR_CREATE_EVENT"
         if tool_name not in self.tools:
-            print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Tool '{tool_name}' not available.{user_interface.Style.RESET_ALL}")
             return {"error": f"Tool '{tool_name}' not available.", "successful": False}
 
-        # Prepare params from event_details, ensuring required ones are present
-        params = {"calendar_id": calendar_id}
+        # Convert event_details to the format expected by Composio
+        params = {
+            "calendar_id": "primary",
+            "summary": event_details.get("summary", "New Event"),
+            "start_datetime": event_details.get("start_datetime"),
+            "timezone": event_details.get("timezone", "Asia/Kolkata"),
+            "description": event_details.get("description", ""),
+            "location": event_details.get("location", "")
+        }
 
-        required_keys = ["summary", "start_datetime", "timezone"] # As per Composio schema, summary is optional, but practically needed
-        for req_key in required_keys:
-            if req_key not in event_details or not event_details[req_key]:
-                # Summary can be optional by schema, but let's enforce it for better UX
-                if req_key == "summary" and not event_details.get(req_key):
-                    params[req_key] = "Untitled Event" # Default if LLM/user missed it
-                else:
-                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Missing required key '{req_key}' for {tool_name}.{user_interface.Style.RESET_ALL}")
-                    return {"error": f"Missing required key '{req_key}' for event creation.", "successful": False}
+        # Calculate end time
+        duration_hours = event_details.get("event_duration_hour", 0)
+        duration_minutes = event_details.get("event_duration_minutes", 30)
+        total_minutes = (duration_hours * 60) + duration_minutes
 
-        params.update(event_details) # Add all details from the validated dict
+        # Add end time calculation
+        from datetime import datetime, timedelta
+        start_dt = datetime.fromisoformat(event_details.get("start_datetime"))
+        end_dt = start_dt + timedelta(minutes=total_minutes)
+        params["end_datetime"] = end_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
-        # Ensure duration defaults if not provided by LLM/user and not in event_details from parsing
-        params.setdefault("event_duration_hour", 0)
-        params.setdefault("event_duration_minutes", 30 if params["event_duration_hour"] == 0 else 0)
+        # Add attendees if provided
+        if event_details.get("attendees"):
+            params["attendees"] = event_details["attendees"]
 
+        # Add meeting room if requested
+        if event_details.get("create_meeting_room", False):
+            params["create_meeting_room"] = True
 
-        print(f"MCP_SM ({self.app_name}): Attempting to call '{tool_name}' with params: { {k:v for k,v in params.items() if k != 'calendar_id'} }") # Log without calendar_id for brevity
+        outcome = await self.ensure_auth_and_call_tool(tool_name, params)
 
-        creation_result_from_mcp = await self.ensure_auth_and_call_tool(tool_name, params)
-
-        # Use the same robust parsing logic as update_calendar_event
-        if isinstance(creation_result_from_mcp, dict) and creation_result_from_mcp.get("error"):
-            return creation_result_from_mcp
-
-        if creation_result_from_mcp and hasattr(creation_result_from_mcp, 'content') and creation_result_from_mcp.content:
-            text_content = getattr(creation_result_from_mcp.content[0], 'text', None)
+        if isinstance(outcome, dict) and outcome.get("error"):
+            return outcome
+        if outcome and hasattr(outcome, 'content') and outcome.content:
+            text_content = getattr(outcome.content[0], 'text', None)
             if text_content:
                 try:
-                    composio_response = json.loads(text_content)
-                    print(f"DEBUG_MCP_HANDLER (CreateEvent): Parsed composio_response: {json.dumps(composio_response, indent=2)}")
-
-                    if composio_response.get("successful") is True:
-                        created_event_data = composio_response.get("data", {}).get("response_data", {})
-                        event_id = created_event_data.get("id", "N/A")
-                        print(f"{user_interface.Fore.GREEN}Successfully created Calendar event (ID: {event_id}).{user_interface.Style.RESET_ALL}")
-                        return {"successful": True, "message": f"Event created (ID: {event_id}).", "created_event_data": created_event_data}
-                    elif composio_response.get("successful") is False and composio_response.get("error") is not None:
-                        # ... (error handling as in update_calendar_event) ...
-                        error_msg = str(composio_response.get("error"))
-                        print(f"{user_interface.Fore.RED}Composio tool '{tool_name}' reported failure: {error_msg}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": error_msg, "composio_reported_error": True}
+                    res = json.loads(text_content)
+                    if res.get("successful"):
+                        return {"successful": True, "message": "Calendar event created successfully.", "created_event_data": res.get("data")}
                     else:
-                        # ... (unclear success handling as in update_calendar_event) ...
-                        print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): Composio response for {tool_name} unclear: {json.dumps(composio_response, indent=2)}{user_interface.Style.RESET_ALL}")
-                        return {"successful": False, "error": f"Composio response for {tool_name} did not indicate clear success or provide a specific error."}
+                        return {"successful": False, "error": res.get("error", "Event creation failed.")}
                 except json.JSONDecodeError:
-                    # ... (JSON decode error handling) ...
-                    print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): JSONDecodeError parsing {tool_name} response: {text_content[:200]}...{user_interface.Style.RESET_ALL}")
-                    return {"successful": False, "error": f"Could not parse {tool_name} JSON response."}
-            else: # text_content is None or empty
-                # ... (no text_content error handling) ...
-                print(f"{user_interface.Fore.YELLOW}MCP_SM ({self.app_name}): No text_content in {tool_name} response item.{user_interface.Style.RESET_ALL}")
-                return {"successful": False, "error": f"No text content in {tool_name} response item."}
+                    return {"successful": False, "error": "Could not parse create event response."}
+        return {"successful": False, "error": f"Unexpected response from {tool_name}."}
 
-        print(f"{user_interface.Fore.RED}MCP_SM ({self.app_name}): Unhandled result structure from {tool_name}. Raw: {creation_result_from_mcp}{user_interface.Style.RESET_ALL}")
-        return {"successful": False, "error": f"Unexpected result structure from {tool_name} after tool call."}
+    # --- update_calendar_event ---
+    async def update_calendar_event(self, event_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        await self.ensure_connected()
+        if not self.session:
+            return {"error": "No active Calendar MCP session (connection failed).", "successful": False}
+
+        tool_name = "GOOGLECALENDAR_UPDATE_EVENT"
+        if tool_name not in self.tools:
+            return {"error": f"Tool '{tool_name}' not available.", "successful": False}
+
+        params = {"calendar_id": "primary", "event_id": event_id}
+        params.update(updates)  # Add the updates to params
+
+        outcome = await self.ensure_auth_and_call_tool(tool_name, params)
+
+        if isinstance(outcome, dict) and outcome.get("error"):
+            return outcome
+        if outcome and hasattr(outcome, 'content') and outcome.content:
+            text_content = getattr(outcome.content[0], 'text', None)
+            if text_content:
+                try:
+                    res = json.loads(text_content)
+                    if res.get("successful"):
+                        return {"successful": True, "message": f"Event {event_id} updated successfully."}
+                    else:
+                        return {"successful": False, "error": res.get("error", "Event update failed.")}
+                except json.JSONDecodeError:
+                    return {"successful": False, "error": "Could not parse update event response."}
+        return {"successful": False, "error": f"Unexpected response from {tool_name}."}
+
+    # --- delete_calendar_event ---
+    async def delete_calendar_event(self, event_id: str) -> Dict[str, Any]:
+        await self.ensure_connected()
+        if not self.session:
+            return {"error": "No active Calendar MCP session (connection failed).", "successful": False}
+
+        tool_name = "GOOGLECALENDAR_DELETE_EVENT"
+        if tool_name not in self.tools:
+            return {"error": f"Tool '{tool_name}' not available.", "successful": False}
+
+        params = {"calendar_id": "primary", "event_id": event_id}
+        outcome = await self.ensure_auth_and_call_tool(tool_name, params)
+
+        if isinstance(outcome, dict) and outcome.get("error"):
+            return outcome
+        if outcome and hasattr(outcome, 'content') and outcome.content:
+            text_content = getattr(outcome.content[0], 'text', None)
+            if text_content:
+                try:
+                    res = json.loads(text_content)
+                    if res.get("successful"):
+                        return {"successful": True, "message": f"Event {event_id} deleted successfully."}
+                    else:
+                        return {"successful": False, "error": res.get("error", "Event deletion failed.")}
+                except json.JSONDecodeError:
+                    return {"successful": False, "error": "Could not parse delete event response."}
+        return {"successful": False, "error": f"Unexpected response from {tool_name}."}
