@@ -2,17 +2,11 @@
 import json
 import traceback
 import asyncio
-from typing import Dict, List, Optional, Any, Tuple, Union
-
-from google import genai # Main SDK
-from google.genai import types as genai_types # For types like GenerateContentConfig, Part, Content
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-
-import config_manager
+import config_manager # For config_manager.USER_EMAIL_KEY
 import calendar_utils # For parsing slots if needed in future prompts
-import user_interface # For colored output (though ideally not directly from here)
-from mcp_handler import McpSessionManager
+from typing import Dict, List, Optional, Any, Tuple
+from google import genai # Main SDK
+from google.genai import types # For types like GenerateContentConfig
 
 # --- Email Processing ---
 async def process_emails_with_llm(
@@ -30,7 +24,7 @@ async def process_emails_with_llm(
         subject = "No Subject"
         sender = "Unknown Sender"
         snippet = email.get("snippet", "No snippet available.")
-        message_text_preview = email.get("messageText", snippet)[:500] # Limiting preview length
+        message_text_preview = email.get("messageText", snippet)[:500]
 
         if email.get("payload") and isinstance(email["payload"].get("headers"), list):
             for header in email["payload"]["headers"]:
@@ -41,7 +35,7 @@ async def process_emails_with_llm(
 
         prompt_email_parts.append(
             f"Email {i+1}:\n"
-            f"ID: {email.get('messageId', email.get('id', 'N/A'))}\n" # Use 'id' as fallback from Gmail API
+            f"ID: {email.get('messageId', 'N/A')}\n"
             f"From: {sender}\n"
             f"Subject: {subject}\n"
             f"Snippet/Preview: {message_text_preview}\n---\n"
@@ -102,13 +96,13 @@ Ensure the entire response is a valid JSON array.
     processed_emails = []
     response_text_for_debugging = "Gemini call did not occur or failed before response was received."
     try:
-        config = genai_types.GenerateContentConfig(
-            response_mime_type="application/json"  # Direct parameter, not nested
+        config_obj = types.GenerateContentConfig(
+            response_mime_type="application/json"
         )
         response = await gemini_client.aio.models.generate_content(
             model=model_name,
-            contents=system_prompt,
-            config=config
+            contents=[system_prompt],
+            config=config_obj # Corrected parameter name to generation_config for client.aio.models
         )
         response_text_for_debugging = response.text
 
@@ -123,7 +117,7 @@ Ensure the entire response is a valid JSON array.
         if isinstance(llm_output, list):
             llm_output_map = {item.get("email_id"): item for item in llm_output if isinstance(item, dict)}
             for original_email_data in emails_data:
-                original_id = original_email_data.get('messageId', original_email_data.get('id'))
+                original_id = original_email_data.get('messageId')
                 processed_item = llm_output_map.get(original_id)
                 if processed_item:
                     processed_emails.append({
@@ -141,22 +135,20 @@ Ensure the entire response is a valid JSON array.
                     })
         else:
             print(f"LLM_PROCESSOR (Emails): Gemini response was not a list as expected: {type(llm_output)}")
-            for original_email_data in emails_data: # Populate with error for each original email
+            for original_email_data in emails_data:
                 processed_emails.append({"original_email_data": original_email_data, "is_important": False, "summary": "LLM response format error.", "suggested_actions": []})
-
     except json.JSONDecodeError as e:
         print(f"LLM_PROCESSOR (Emails): Failed to decode Gemini JSON response: {e}")
         print(f"LLM_PROCESSOR (Emails): Raw response that failed parsing:\n{response_text_for_debugging}")
-        for original_email_data in emails_data: # Populate with error
+        for original_email_data in emails_data:
              processed_emails.append({"original_email_data": original_email_data, "is_important": False, "summary": "LLM JSON parsing error.", "suggested_actions": []})
     except Exception as e:
         print(f"LLM_PROCESSOR (Emails): Error during Gemini API call: {e}")
         print(f"LLM_PROCESSOR (Emails): Raw response that might have caused error (if available):\n{response_text_for_debugging}")
         traceback.print_exc()
-        for original_email_data in emails_data: # Populate with error
+        for original_email_data in emails_data:
              processed_emails.append({"original_email_data": original_email_data, "is_important": False, "summary": "LLM API call error.", "suggested_actions": []})
     return processed_emails
-
 
 # --- Calendar Event Processing ---
 async def process_calendar_events_with_llm(
@@ -174,19 +166,23 @@ async def process_calendar_events_with_llm(
     for i, event in enumerate(events_data):
         summary = event.get("summary", "No Title")
         event_id = event.get("id", "N/A")
-        start_time_obj = calendar_utils.parse_iso_to_ist(event.get("start", {}).get("dateTime", ""))
-        end_time_obj = calendar_utils.parse_iso_to_ist(event.get("end", {}).get("dateTime", ""))
-
-        start_time_display = start_time_obj.strftime("%Y-%m-%d %I:%M %p %Z") if start_time_obj else "No Start Time"
-        end_time_display = end_time_obj.strftime("%Y-%m-%d %I:%M %p %Z") if end_time_obj else "No End Time"
-
-        description_snippet = event.get("description", "No description")[:150] # Limit snippet
+        start_time = event.get("start", {}).get("dateTime", "No Start Time")
+        end_time = event.get("end", {}).get("dateTime", "No End Time")
+        description_snippet = event.get("description", "No description")[:150]
+        attendees_list = event.get("attendees", [])
+        attendees_emails = [
+            att.get("email") for att in attendees_list
+            if isinstance(att, dict) and att.get("email") and not att.get("resource", False)
+        ]
+        user_main_email = user_config.get(config_manager.USER_EMAIL_KEY)
+        if user_main_email and user_main_email in attendees_emails:
+            attendees_emails.remove(user_main_email)
 
         prompt_event_parts.append(
             f"Event {i+1} (ID: {event_id}):\n"
             f"  Title: {summary}\n"
-            f"  Start: {start_time_display}\n" # Use formatted time
-            f"  End: {end_time_display}\n"     # Use formatted time
+            f"  Start: {start_time}\n"
+            f"  End: {end_time}\n"
             f"  Description Snippet: {description_snippet}\n---\n"
         )
 
@@ -227,14 +223,13 @@ Ensure the entire response is a valid JSON array.
     processed_events = []
     response_text_for_debugging = "Gemini call did not occur or failed before response was received."
     try:
-        config = genai_types.GenerateContentConfig(
+        config_obj = types.GenerateContentConfig(
             response_mime_type="application/json"
         )
-
         response = await gemini_client.aio.models.generate_content(
             model=model_name,
             contents=[system_prompt],
-            config=config
+            config=config_obj # Corrected parameter name to generation_config for client.aio.models
         )
         response_text_for_debugging = response.text
 
@@ -280,7 +275,6 @@ Ensure the entire response is a valid JSON array.
     return processed_events
 
 
-# --- Email Reply Drafting ---
 async def draft_email_reply_with_llm(
     gemini_client: genai.Client,
     model_name: str,
@@ -290,14 +284,16 @@ async def draft_email_reply_with_llm(
     user_priorities: str,
     user_edit_instructions: Optional[str] = None,
     available_slots: Optional[List[Dict[str, str]]] = None
-) -> Dict[str, Any]:
+) -> Dict[str, str]:
+
     if not original_email_data:
         return {"error": "Original email data not provided."}
 
     original_subject = "No Subject"
     original_sender_email_only = None
     original_sender_full_header = "Unknown Sender"
-    original_thread_id = original_email_data.get("threadId", "N/A") # Get threadId for reply
+    original_snippet = original_email_data.get("snippet", "")
+    original_thread_id = original_email_data.get("threadId", "N/A")
 
     payload = original_email_data.get("payload")
     if payload and isinstance(payload.get("headers"), list):
@@ -305,26 +301,25 @@ async def draft_email_reply_with_llm(
             header_name_lower = header.get("name", "").lower()
             if header_name_lower == "from":
                 original_sender_full_header = header.get("value", "Unknown Sender")
-                # Robust email parsing from 'From' header
                 if "<" in original_sender_full_header and ">" in original_sender_full_header:
                     start_index = original_sender_full_header.find("<") + 1
                     end_index = original_sender_full_header.find(">")
                     if start_index < end_index:
                         original_sender_email_only = original_sender_full_header[start_index:end_index].strip()
-                elif "@" in original_sender_full_header: # Fallback if no < >
+                elif "@" in original_sender_full_header:
                     parts = original_sender_full_header.split()
-                    for part in parts:
-                        if "@" in part and "." in part:
-                            original_sender_email_only = part.strip().strip('<>')
-                            break
-                    if not original_sender_email_only:
-                         original_sender_email_only = original_sender_full_header.strip()
-
-
+                    if len(parts) > 1 and "@" in parts[-1]:
+                        potential_email = parts[-1]
+                        if "@" in potential_email and "." in potential_email:
+                            original_sender_email_only = potential_email.strip()
+                        else:
+                            original_sender_email_only = original_sender_full_header.strip()
+                    elif "@" in original_sender_full_header and "." in original_sender_full_header :
+                        original_sender_email_only = original_sender_full_header.strip()
             elif header_name_lower == "subject":
                 original_subject = header.get("value", "No Subject")
 
-    if not original_sender_email_only: # Fallback to top-level sender if header parsing failed
+    if not original_sender_email_only:
         composio_top_level_sender = original_email_data.get("sender")
         if composio_top_level_sender:
             original_sender_full_header = composio_top_level_sender
@@ -333,34 +328,45 @@ async def draft_email_reply_with_llm(
                 end_index = composio_top_level_sender.find(">")
                 if start_index < end_index:
                     original_sender_email_only = composio_top_level_sender[start_index:end_index].strip()
-            elif "@" in composio_top_level_sender : # Fallback
+            elif "@" in composio_top_level_sender and "." in composio_top_level_sender:
                  parts = composio_top_level_sender.split()
-                 for part in parts:
-                     if "@" in part and "." in part:
-                         original_sender_email_only = part.strip().strip('<>')
-                         break
-                 if not original_sender_email_only:
+                 if len(parts) > 1 and "@" in parts[-1]:
+                     potential_email = parts[-1]
+                     if "@" in potential_email and "." in potential_email:
+                         original_sender_email_only = potential_email.strip()
+                     else:
+                        original_sender_email_only = composio_top_level_sender.strip()
+                 elif "@" in composio_top_level_sender and "." in composio_top_level_sender:
                      original_sender_email_only = composio_top_level_sender.strip()
 
-
     if not original_sender_email_only:
-        print(f"LLM_PROCESSOR (Draft Reply): CRITICAL - Could not determine a valid recipient email for the reply from header or sender field.")
+        print(f"LLM_PROCESSOR (Draft Reply): CRITICAL - Could not determine a valid recipient email for the reply from header '{original_sender_full_header}' or top-level '{original_email_data.get('sender')}'.")
         return {"error": "Could not determine a valid recipient email for the reply."}
+    else:
+        print(f"LLM_PROCESSOR (Draft Reply): Determined recipient for reply as: '{original_sender_email_only}' (from full: '{original_sender_full_header}')")
 
-    original_body_for_llm = original_email_data.get("messageText", original_email_data.get("snippet", "No content available."))
-    if not original_body_for_llm or original_body_for_llm == "No content available.": # Attempt to decode payload if messageText is poor
-        if payload and isinstance(payload.get("parts"), list):
-            for part in payload["parts"]:
-                if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
-                    try:
-                        import base64
-                        decoded_body = base64.urlsafe_b64decode(part["body"]["data"].encode('ASCII')).decode('utf-8')
-                        original_body_for_llm = decoded_body
-                        break
-                    except Exception: pass # Keep snippet if decoding fails
+    original_body_for_llm = original_email_data.get("snippet", "No content available.")
+
+    if original_email_data.get("messageText"):
+        original_body_for_llm = original_email_data["messageText"]
+    elif payload and isinstance(payload.get("parts"), list):
+        for part in payload["parts"]:
+            if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+                try:
+                    import base64
+                    decoded_body = base64.urlsafe_b64decode(part["body"]["data"].encode('ASCII')).decode('utf-8')
+                    original_body_for_llm = decoded_body
+                    break
+                except Exception as e:
+                    print(f"LLM_PROCESSOR (Draft Reply): Error decoding payload part: {e}")
+                    original_body_for_llm = original_email_data.get("snippet", "Error reading body.")
+                    break
 
     max_body_length_for_prompt = 1500
-    original_body_for_llm_preview = (original_body_for_llm[:max_body_length_for_prompt] + "\n[...message truncated...]") if len(original_body_for_llm) > max_body_length_for_prompt else original_body_for_llm
+    if len(original_body_for_llm) > max_body_length_for_prompt:
+        original_body_for_llm_preview = original_body_for_llm[:max_body_length_for_prompt] + "\n[...message truncated...]"
+    else:
+        original_body_for_llm_preview = original_body_for_llm
 
     prompt_construction_parts = [
         f"You are an AI assistant helping a user draft an email reply. You have access to the user's persona and priorities. However, these are for your general information for steering the direction of the draft. Overall, the draft should be written focused more on the email that it is in response to.",
@@ -373,8 +379,10 @@ async def draft_email_reply_with_llm(
         f"Body Preview of Original Email:\n{original_body_for_llm_preview}",
         f"\nThe user wants to: \"{action_sentiment}\"."
     ]
+
     if user_edit_instructions:
         prompt_construction_parts.append(f"\nUser's specific instructions for this draft: \"{user_edit_instructions}\"")
+
     if available_slots:
         prompt_construction_parts.append("\nThe user has indicated they are free during the following time slots. If relevant to the reply sentiment (e.g., proposing meeting times), please pick 1-3 suitable options from this list and incorporate them naturally into the email body. Format them readably (e.g., 'June 3rd from 2:00 PM to 3:00 PM IST').")
         prompt_construction_parts.append("Available Slots:")
@@ -384,6 +392,7 @@ async def draft_email_reply_with_llm(
             if start_dt and end_dt:
                 slot_text = f"- {start_dt.strftime('%A, %B %d, %Y, from %I:%M %p')} to {end_dt.strftime('%I:%M %p %Z')}"
                 prompt_construction_parts.append(slot_text)
+
     prompt_construction_parts.append(
         "\nBased on this, please generate:"
         "\n1. A suitable reply \"subject\" line (usually \"Re: [original subject]\")."
@@ -397,39 +406,52 @@ async def draft_email_reply_with_llm(
         "\nEnsure the body is plain text. Do not include any other explanatory text outside the JSON object."
     )
     system_prompt_for_llm = "\n".join(prompt_construction_parts)
+
     response_text_for_debugging = "Gemini call for draft did not occur or failed."
     try:
-        config = genai_types.GenerateContentConfig(
+        config_obj = types.GenerateContentConfig(
             response_mime_type="application/json"
         )
-
         response = await gemini_client.aio.models.generate_content(
             model=model_name,
             contents=[system_prompt_for_llm],
-            config=config
+            config=config_obj # THIS WAS THE ERROR - SDK uses 'generation_config' for GenerativeModel.generate_content, but client.models.generate_content uses 'config'
         )
         response_text_for_debugging = response.text
+
         cleaned_response_text = response.text.strip()
         if cleaned_response_text.startswith("```json"): cleaned_response_text = cleaned_response_text[7:]
         if cleaned_response_text.endswith("```"): cleaned_response_text = cleaned_response_text[:-3]
+
         draft_data = json.loads(cleaned_response_text)
         if isinstance(draft_data, dict) and "subject" in draft_data and "body" in draft_data:
             return {
-                "subject": draft_data["subject"], "body": draft_data["body"],
+                "subject": draft_data["subject"],
+                "body": draft_data["body"],
                 "recipient_email_for_reply": original_sender_email_only,
-                "original_thread_id": original_thread_id, "error": None
+                "original_thread_id": original_thread_id,
+                "error": None
             }
         else:
+            print(f"LLM_PROCESSOR (Draft Reply): LLM response was not a dict with subject/body: {draft_data}")
             return {"error": "LLM did not return draft in expected subject/body format."}
     except json.JSONDecodeError:
+        print(f"LLM_PROCESSOR (Draft Reply): Failed to decode Gemini JSON response for draft.")
+        print(f"LLM_PROCESSOR (Draft Reply): Raw response: {response_text_for_debugging}")
         return {"error": "LLM JSON parsing error for draft."}
     except Exception as e:
+        print(f"LLM_PROCESSOR (Draft Reply): Error during Gemini API call for draft: {e}")
+        print(f"LLM_PROCESSOR (Draft Reply): Raw response (if available): {response_text_for_debugging}")
+        traceback.print_exc()
         return {"error": f"LLM API call error for draft: {str(e)}"}
 
-# --- Event Creation Parsing ---
 async def parse_event_creation_details_from_suggestion(
-    gemini_client: genai.Client, model_name: str, llm_suggestion_text: str,
-    original_context_text: Optional[str], user_persona: str, user_priorities: str,
+    gemini_client: genai.Client,
+    model_name: str,
+    llm_suggestion_text: str,
+    original_context_text: Optional[str],
+    user_persona: str,
+    user_priorities: str,
     current_datetime_iso: str
 ) -> Dict[str, Any]:
     prompt_parts = [
@@ -442,6 +464,7 @@ async def parse_event_creation_details_from_suggestion(
     if original_context_text:
         prompt_parts.append(f"\nThis suggestion was made in the context of the following text (e.g., an email):"
                             f"\n\"\"\"\n{original_context_text[:1000]}\n\"\"\"")
+
     prompt_parts.extend([
         f"\nBased on this, extract the following details for the new event. If a detail is not mentioned, use a sensible default or leave it null/empty where appropriate:",
         f"- summary (string, event title, make it concise)",
@@ -468,501 +491,109 @@ async def parse_event_creation_details_from_suggestion(
         f"}}"
     ])
     system_prompt = "\n".join(prompt_parts)
+
     response_text_for_debugging = "Gemini call for parsing event creation details did not occur or failed."
     try:
-        config = genai_types.GenerateContentConfig(
+        config_obj = types.GenerateContentConfig(
             response_mime_type="application/json"
         )
-
         response = await gemini_client.aio.models.generate_content(
             model=model_name,
             contents=[system_prompt],
-            config=config
+            config=config_obj # THIS WAS THE ERROR - SDK uses 'generation_config' for GenerativeModel.generate_content, but client.models.generate_content uses 'config'
         )
         response_text_for_debugging = response.text
+
         cleaned_response_text = response.text.strip()
         if cleaned_response_text.startswith("```json"): cleaned_response_text = cleaned_response_text[7:]
         if cleaned_response_text.endswith("```"): cleaned_response_text = cleaned_response_text[:-3]
+
         parsed_details = json.loads(cleaned_response_text)
+
         if not all(k in parsed_details for k in ["summary", "start_datetime", "timezone"]):
+            print(f"LLM_PROCESSOR (Parse Create Event): LLM did not return all required fields (summary, start_datetime, timezone). Parsed: {parsed_details}")
             return {"error": "LLM failed to extract all required event details (summary, start_datetime, timezone)."}
+
         parsed_details.setdefault("event_duration_hour", 0)
         parsed_details.setdefault("event_duration_minutes", 30 if parsed_details["event_duration_hour"] == 0 else 0)
         parsed_details.setdefault("attendees", [])
         parsed_details.setdefault("create_meeting_room", True)
+
         return parsed_details
+
     except json.JSONDecodeError:
+        print(f"LLM_PROCESSOR (Parse Create Event): Failed to decode Gemini JSON response.")
+        print(f"LLM_PROCESSOR (Parse Create Event): Raw response: {response_text_for_debugging}")
         return {"error": "LLM JSON parsing error for event creation details."}
     except Exception as e:
+        print(f"LLM_PROCESSOR (Parse Create Event): Error during Gemini API call: {e}")
+        traceback.print_exc()
         return {"error": f"LLM API call error for event creation details: {str(e)}"}
 
-async def get_llm_tool_call_from_natural_language(
-    gemini_client: genai.Client,
-    model_name: str,
-    user_query: str,
-    active_mcp_sessions_for_llm: List[ClientSession],  # Back to raw ClientSession objects
-    user_config: Dict[str, Any]
-) -> Union[str, Dict[str, Any]]:
-    print(f"LLM_PROCESSOR (NLI_ToolCall): Getting tool call for query: '{user_query}'")
 
-    if not active_mcp_sessions_for_llm:
-        return "Sorry, I don't have any tools (like Gmail or Calendar access) currently available to help with that."
-
-    print(f"LLM_PROCESSOR (NLI_ToolCall): Sending to Gemini with {len(active_mcp_sessions_for_llm)} MCP session(s) as tools.")
-
-    # Enhanced system prompt
-    user_persona = user_config.get(config_manager.USER_PERSONA_KEY, "a professional")
-    user_email = user_config.get(config_manager.USER_EMAIL_KEY, "user")
-
-    # Get tool info from primary manager
-    tool_info = ""
-    primary_manager = user_config.get('_primary_manager')
-    if primary_manager:
-        tool_count = len(primary_manager.tools)
-        manager_type = 'calendar' if 'calendar' in primary_manager.app_name.lower() else 'gmail'
-        tool_info = f"\n- Currently using {manager_type} session with {tool_count} tools available"
-
-    # Create system prompt that encourages tool usage
-    system_prompt_content = f"""You are MCliPPy, a proactive AI assistant designed to help manage emails and calendar events through Gmail and Google Calendar tools.
-
-Your user is {user_email}, whose role is: {user_persona}
-
-You have access to tools for:
-- Gmail: Reading emails, sending replies, managing threads, searching messages
-- Google Calendar: Creating events, finding free slots, updating/deleting events, managing schedules
-{tool_info}
-
-IMPORTANT: You MUST use the available tools to complete user requests. Do NOT provide text-only responses when tools can help.
-
-When users ask to:
-- Create calendar events → USE calendar creation tools
-- Check emails → USE email fetching tools
-- Find free time → USE calendar free slot tools
-- Draft replies → USE email reply tools
-
-Always identify yourself as MCliPpy when asked who you are.
-
-User query: {user_query}"""
-
-    # Get conversation history
-    conversation_history = user_config.get('_conversation_history')
-
-    if conversation_history and conversation_history.get_history():
-        # Use conversation history with system context
-        history_contents = conversation_history.get_recent_history(max_exchanges=6)
-
-        # Create system message
-        contents = [genai_types.Content(
-            role="user",
-            parts=[genai_types.Part.from_text(text=f"System: {system_prompt_content}")]
-        )]
-
-        # Add conversation history
-        contents.extend(history_contents)
-
-        print(f"LLM_PROCESSOR (NLI_ToolCall): Using conversation history with {len(history_contents)} previous exchanges")
-    else:
-        # No history - create system prompt with current query
-        contents = [genai_types.Content(
-            role="user",
-            parts=[genai_types.Part.from_text(text=f"{system_prompt_content}\n\nUser query: {user_query}")]
-        )]
-        print(f"LLM_PROCESSOR (NLI_ToolCall): No conversation history, using system prompt + current query")
-
-    # Check if this is a query that should definitely use tools
-    tool_requiring_queries = [
-        "create", "schedule", "event", "calendar", "meeting", "email", "check", "fetch",
-        "reply", "send", "free time", "available", "busy", "slot", "find", "list"
-    ]
-
-    should_force_tool_use = any(keyword in user_query.lower() for keyword in tool_requiring_queries)
-
-    try:
-        if should_force_tool_use:
-            print(f"LLM_PROCESSOR (NLI_ToolCall): Query requires tools - using ANY mode to force function calling")
-            config = genai_types.GenerateContentConfig(
-                temperature=0.1,  # Lower temperature for more deterministic tool calls
-                tools=active_mcp_sessions_for_llm,  # Raw ClientSession objects
-                tool_config=genai_types.ToolConfig(
-                    function_calling_config=genai_types.FunctionCallingConfig(
-                        mode="ANY"  # FORCE function calling
-                    )
-                )
-            )
-        else:
-            print(f"LLM_PROCESSOR (NLI_ToolCall): General query - using AUTO mode")
-            config = genai_types.GenerateContentConfig(
-                temperature=0.2,
-                tools=active_mcp_sessions_for_llm,
-                tool_config=genai_types.ToolConfig(
-                    function_calling_config=genai_types.FunctionCallingConfig(
-                        mode="AUTO"
-                    )
-                )
-            )
-
-        print(f"LLM_PROCESSOR (NLI_ToolCall): Making API call with function calling mode: {'ANY' if should_force_tool_use else 'AUTO'}")
-
-        response = await gemini_client.aio.models.generate_content(
-            model=model_name,
-            contents=contents,
-            config=config
-        )
-
-        print(f"LLM_PROCESSOR (NLI_ToolCall): Received response from Gemini")
-
-        # Check for function call in the response
-        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-            print(f"LLM_PROCESSOR (NLI_ToolCall): Response has {len(response.candidates[0].content.parts)} parts")
-
-            for i, part in enumerate(response.candidates[0].content.parts):
-                print(f"LLM_PROCESSOR (NLI_ToolCall): Part {i}: {type(part).__name__}")
-
-                if hasattr(part, 'function_call') and part.function_call:
-                    print(f"LLM_PROCESSOR (NLI_ToolCall): 🔧 Gemini suggested function call: {part.function_call.name}")
-                    print(f"LLM_PROCESSOR (NLI_ToolCall): Function args: {dict(part.function_call.args)}")
-                    return {
-                        "function_call": part.function_call,
-                        "model_response_parts": list(response.candidates[0].content.parts)
-                    }
-                elif hasattr(part, 'text') and part.text:
-                    print(f"LLM_PROCESSOR (NLI_ToolCall): Part {i} is text: {part.text[:100]}...")
-
-        print("LLM_PROCESSOR (NLI_ToolCall): Gemini provided a direct text response (no function calls)")
-
-        # If we forced tool use but got no function call, something's wrong
-        if should_force_tool_use:
-            print("LLM_PROCESSOR (NLI_ToolCall): WARNING - Expected function call but got text response!")
-            return "I should be able to help with that using my tools, but I'm having trouble accessing them right now. Can you try rephrasing your request?"
-
-        # Extract text from response
-        response_text = ""
-        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text:
-                    response_text += part.text
-
-        return response_text if response_text else "I'm not sure how to respond to that."
-
-    except Exception as e:
-        error_str = str(e)
-        print(f"{user_interface.Fore.RED}LLM_PROCESSOR (NLI_ToolCall): Error during Gemini API call: {e}{user_interface.Style.RESET_ALL}")
-        traceback.print_exc()
-
-        if "already defined" in error_str:
-            return "I'm having trouble with overlapping tool definitions. Let me try to help you in a different way. What specifically would you like me to do?"
-
-        return f"Sorry, I encountered an error trying to process your request: {str(e)}"
-
-
-async def get_final_response_after_tool_execution(
-    gemini_client: genai.Client,
-    model_name: str,
-    original_user_query: str,
-    previous_model_parts: List[genai_types.Part],
-    tool_name: str,
-    tool_execution_result: Dict[str, Any],
-    active_mcp_sessions_for_llm: List,
-    user_config: Dict[str, Any]
-) -> str:
-    print(f"LLM_PROCESSOR (NLI_FinalResp): Getting final response after executing tool '{tool_name}'.")
-
-    # Add system context for tool response
-    user_email = user_config.get(config_manager.USER_EMAIL_KEY, "user")
-    system_context = f"You are MCliPpy, AI assistant for {user_email}. You just executed the tool '{tool_name}' successfully. Provide a helpful summary of what was accomplished."
-
-    # Construct the conversation history for Gemini
-    history_contents = [
-        genai_types.Content(
-            role="user",
-            parts=[genai_types.Part.from_text(text=f"System: {system_context}\n\nOriginal query: {original_user_query}")]
-        ),
-        genai_types.Content(
-            role="model",
-            parts=previous_model_parts
-        ),
-        genai_types.Content(
-            role="tool",
-            parts=[genai_types.Part.from_function_response(
-                name=tool_name,
-                response=tool_execution_result
-            )]
-        )
-    ]
-
-    print(f"LLM_PROCESSOR (NLI_FinalResp): Tool result: {str(tool_execution_result)[:200]}...")
-
-    # For this call, disable function calling for final response
-    config = genai_types.GenerateContentConfig(
-        temperature=0.7,
-        tool_config=genai_types.ToolConfig(
-            function_calling_config=genai_types.FunctionCallingConfig(
-                mode="NONE"  # Disable function calling for final summary
-            )
-        )
-    )
-
-    try:
-        response = await gemini_client.aio.models.generate_content(
-            model=model_name,
-            contents=history_contents,
-            config=config
-        )
-
-        final_text = response.text if response.text else "I've processed that, but I don't have anything more to say."
-        print(f"LLM_PROCESSOR (NLI_FinalResp): Generated final response: {final_text[:100]}...")
-        return final_text
-
-    except Exception as e:
-        print(f"{user_interface.Fore.RED}LLM_PROCESSOR (NLI_FinalResp): Error during final response: {e}{user_interface.Style.RESET_ALL}")
-        traceback.print_exc()
-
-        # Fallback: present tool result directly
-        if tool_execution_result.get("successful"):
-            success_message = tool_execution_result.get('message', f"Tool '{tool_name}' executed successfully")
-            return f"✅ {success_message}"
-        else:
-            error_message = tool_execution_result.get('error', 'Unknown error')
-            return f"❌ Tool '{tool_name}' failed: {error_message}"
-
-
-# --- Test Stub (Comprehensive) ---
-
+# --- Test Stub for this module ---
 async def _test_llm_processor():
-    """Comprehensive test for all LLM processor functions with new SDK."""
-    print("=" * 60)
-    print("--- Testing llm_processor.py (All Functions) ---")
-    print("=" * 60)
+    print("--- Testing llm_processor.py ---")
 
-    # Get API key and initialize client
     google_api_key_from_config = config_manager.DEV_CONFIG.get(config_manager.ENV_GOOGLE_API_KEY)
     MODEL_NAME_TEST = 'gemini-2.5-flash-preview-05-20'
 
     if not google_api_key_from_config:
-        print("❌ GOOGLE_API_KEY not found. Please set it in your .env file.")
-        print("Skipping all LLM tests.")
+        print(f"{config_manager.ENV_GOOGLE_API_KEY} not found by config_manager. Ensure it's in .env and config_manager.py loads it.")
         return
 
+    gemini_client_for_test = None
     try:
+        print(f"Initializing Gemini client with API key: {'********' if google_api_key_from_config else 'None'}")
         gemini_client_for_test = genai.Client(api_key=google_api_key_from_config)
-        print(f"✅ Gemini client initialized with model '{MODEL_NAME_TEST}'")
+        print(f"Gemini client for testing model '{MODEL_NAME_TEST}' initialized successfully.")
     except Exception as e:
-        print(f"❌ Failed to initialize Gemini client: {e}")
+        print(f"Error initializing Gemini client for testing: {e}")
+        traceback.print_exc()
         return
 
-    # Mock user config for testing
-    mock_user_config = {
+    mock_persona = "Product Manager focused on new feature development and team coordination."
+    mock_priorities = "Client feedback, project deadlines, team blockers, and innovative ideas."
+
+    mock_user_config_for_test = {
         config_manager.USER_EMAIL_KEY: "test_user@example.com",
-        config_manager.USER_PERSONA_KEY: "a software developer testing AI integration",
-        config_manager.USER_PRIORITIES_KEY: "testing functionality and debugging code",
     }
 
-    print("\n" + "="*50)
-    print("TEST 1: Email Processing with LLM")
-    print("="*50)
+    mock_emails_data_from_tool = {"data": {"messages": [
+        {"messageId": "email123", "snippet": "Q3 budget deadline approaching next Friday.", "messageText": "Team, quick reminder that the Q3 budget deadline is fast approaching next Friday. Please ensure all submissions are in by EOD Thursday.", "payload": {"headers": [{"name": "Subject", "value": "URGENT: Budget Deadline"}, {"name": "From", "value": "Boss <boss@example.com>"}]}},
+        {"messageId": "email456", "snippet": "Team lunch tomorrow to celebrate!", "messageText": "Hey everyone, to celebrate the successful project launch, we're having a team lunch tomorrow at The Great Eatery at 1 PM. Hope to see you all there!", "payload": {"headers": [{"name": "Subject", "value": "Team Lunch!"}, {"name": "From", "value": "Friendly Colleague <colleague@example.com>"}]}},
+        {"messageId": "email789", "snippet": "Your subscription to CloudServicePro is renewing soon.", "messageText": "This is a notification that your annual subscription to CloudServicePro will auto-renew on June 15th for $99.", "payload": {"headers": [{"name": "Subject", "value": "Subscription Renewal Notice"}, {"name": "From", "value": "CloudServicePro <billing@cloudservicepro.com>"}]}}
+    ]}}
+    actual_mock_emails = mock_emails_data_from_tool.get("data", {}).get("messages", [])
 
-    # Test email processing
-    mock_emails_data = [
-        {
-            "messageId": "test_email_1",
-            "id": "test_email_1",  # Fallback ID
-            "snippet": "Meeting request for tomorrow at 2 PM",
-            "payload": {
-                "headers": [
-                    {"name": "from", "value": "john.doe@example.com"},
-                    {"name": "subject", "value": "Important Meeting Request"}
-                ]
-            },
-            "messageText": "Hi! Could we schedule a meeting tomorrow at 2 PM to discuss the project timeline?"
-        }
+    if actual_mock_emails:
+        print("\nProcessing mock emails...")
+        processed_emails = await process_emails_with_llm(gemini_client_for_test, MODEL_NAME_TEST, actual_mock_emails, mock_persona, mock_priorities)
+        print("\n--- Processed Emails Output from LLM ---")
+        for pe in processed_emails:
+            print(json.dumps(pe, indent=2))
+            print("-" * 20)
+    else:
+        print("No mock emails to process.")
+
+    mock_calendar_events = [
+        {"id": "cal_event_1", "summary": "Project Phoenix Daily Standup", "start": {"dateTime": "2025-05-31T09:00:00-07:00"}, "end": {"dateTime": "2025-05-31T09:15:00-07:00"}, "attendees": [{"email":"dev1@example.com"}, {"email":"dev2@example.com"}, {"email":"test_user@example.com"}]},
+        {"id": "cal_event_2", "summary": "Client Demo - Alpha Release", "start": {"dateTime": "2025-05-31T14:00:00-07:00"}, "end": {"dateTime": "2025-05-31T15:00:00-07:00"}, "description": "Showcase new features to Client X. Focus on UI improvements and performance gains.", "location": "ClientX HQ, Meeting Room 3"}
     ]
-
-    try:
-        email_results = await process_emails_with_llm(
+    if mock_calendar_events:
+        print("\nProcessing mock calendar events...")
+        processed_events = await process_calendar_events_with_llm(
             gemini_client_for_test,
             MODEL_NAME_TEST,
-            mock_emails_data,
-            mock_user_config[config_manager.USER_PERSONA_KEY],
-            mock_user_config[config_manager.USER_PRIORITIES_KEY]
+            mock_calendar_events,
+            mock_user_config_for_test,
+            mock_persona,
+            mock_priorities
         )
-        print(f"✅ Email processing successful. Processed {len(email_results)} emails.")
-        if email_results:
-            print(f"   First result - Important: {email_results[0].get('is_important')}")
-            print(f"   Summary: {email_results[0].get('summary', 'N/A')[:100]}...")
-    except Exception as e:
-        print(f"❌ Email processing failed: {e}")
-        traceback.print_exc()
-
-    print("\n" + "="*50)
-    print("TEST 2: Calendar Event Processing with LLM")
-    print("="*50)
-
-    # Test calendar event processing
-    mock_events_data = [
-        {
-            "id": "test_event_1",
-            "summary": "Team Standup",
-            "start": {"dateTime": "2025-06-05T09:00:00+05:30"},
-            "end": {"dateTime": "2025-06-05T09:30:00+05:30"},
-            "description": "Daily team standup meeting"
-        }
-    ]
-
-    try:
-        event_results = await process_calendar_events_with_llm(
-            gemini_client_for_test,
-            MODEL_NAME_TEST,
-            mock_events_data,
-            mock_user_config,
-            mock_user_config[config_manager.USER_PERSONA_KEY],
-            mock_user_config[config_manager.USER_PRIORITIES_KEY]
-        )
-        print(f"✅ Calendar processing successful. Processed {len(event_results)} events.")
-        if event_results:
-            print(f"   First result summary: {event_results[0].get('summary_llm', 'N/A')[:100]}...")
-    except Exception as e:
-        print(f"❌ Calendar processing failed: {e}")
-        traceback.print_exc()
-
-    print("\n" + "="*50)
-    print("TEST 3: Email Reply Drafting")
-    print("="*50)
-
-    try:
-        reply_result = await draft_email_reply_with_llm(
-            gemini_client_for_test,
-            MODEL_NAME_TEST,
-            mock_emails_data[0],  # Use the first mock email
-            "confirm availability and suggest alternative times",
-            mock_user_config[config_manager.USER_PERSONA_KEY],
-            mock_user_config[config_manager.USER_PRIORITIES_KEY]
-        )
-
-        if not reply_result.get("error"):  # Check if error is falsy
-            print("✅ Email reply drafting successful.")
-            print(f"   Subject: {reply_result.get('subject', 'N/A')}")
-            print(f"   Body preview: {reply_result.get('body', 'N/A')[:100]}...")
-        else:
-            print(f"❌ Email reply drafting failed: {reply_result['error']}")
-    except Exception as e:
-        print(f"❌ Email reply drafting failed: {e}")
-        traceback.print_exc()
-
-    print("\n" + "="*50)
-    print("TEST 4: Event Creation Parsing")
-    print("="*50)
-
-    try:
-        from datetime import datetime
-        current_datetime_iso = datetime.now().isoformat()
-
-        event_parsing_result = await parse_event_creation_details_from_suggestion(
-            gemini_client_for_test,
-            MODEL_NAME_TEST,
-            "Schedule a team meeting for tomorrow at 2 PM about project review",
-            "Email context: Need to discuss Q2 project milestones",
-            mock_user_config[config_manager.USER_PERSONA_KEY],
-            mock_user_config[config_manager.USER_PRIORITIES_KEY],
-            current_datetime_iso
-        )
-
-        if "error" not in event_parsing_result:
-            print("✅ Event creation parsing successful.")
-            print(f"   Summary: {event_parsing_result.get('summary', 'N/A')}")
-            print(f"   Start time: {event_parsing_result.get('start_datetime', 'N/A')}")
-        else:
-            print(f"❌ Event creation parsing failed: {event_parsing_result['error']}")
-    except Exception as e:
-        print(f"❌ Event creation parsing failed: {e}")
-        traceback.print_exc()
-
-    print("\n" + "="*50)
-    print("TEST 5: NLI Tool Call Function (No MCP Sessions)")
-    print("="*50)
-
-    # Test NLI function with empty MCP sessions (should return fallback message)
-    try:
-        nli_result = await get_llm_tool_call_from_natural_language(
-            gemini_client_for_test,
-            MODEL_NAME_TEST,
-            "What meetings do I have tomorrow?",
-            [],  # Empty MCP sessions list
-            mock_user_config
-        )
-
-        if isinstance(nli_result, str):
-            print("✅ NLI tool call test successful (no tools available).")
-            print(f"   Response: {nli_result}")
-        else:
-            print(f"❌ Unexpected NLI result type: {type(nli_result)}")
-    except Exception as e:
-        print(f"❌ NLI tool call test failed: {e}")
-        traceback.print_exc()
-
-    print("\n" + "="*50)
-    print("TEST 6: Final Response Function (Mock)")
-    print("="*50)
-
-    # Test final response function with mock data
-    try:
-        from google.genai import types as genai_types
-
-        # Mock previous model parts (simulating a function call)
-        mock_previous_parts = [
-            genai_types.Part.from_function_call(
-                name="get_calendar_events",
-                args={"date": "2025-06-06"}
-            )
-        ]
-
-        mock_tool_result = {
-            "successful": True,
-            "message": "Retrieved 3 calendar events",
-            "data": [
-                {"title": "Morning Standup", "time": "09:00"},
-                {"title": "Project Review", "time": "14:00"},
-                {"title": "Client Call", "time": "16:00"}
-            ]
-        }
-
-        final_response = await get_final_response_after_tool_execution(
-            gemini_client_for_test,
-            MODEL_NAME_TEST,
-            "What meetings do I have tomorrow?",
-            mock_previous_parts,
-            "get_calendar_events",
-            mock_tool_result,
-            [],  # Empty MCP sessions
-            mock_user_config
-        )
-
-        print("✅ Final response generation successful.")
-        print(f"   Response: {final_response[:150]}...")
-
-    except Exception as e:
-        print(f"❌ Final response test failed: {e}")
-        traceback.print_exc()
-
-    print("\n" + "="*60)
-    print("🎉 ALL TESTS COMPLETED!")
-    print("="*60)
-    print("Note: These tests use actual Gemini API calls.")
-    print("If any tests failed, check the error messages above.")
-    print("For MCP integration tests, you'll need actual MCP servers running.")
-
+        print("\n--- Processed Calendar Events Output from LLM ---")
+        for pe_cal in processed_events:
+            print(json.dumps(pe_cal, indent=2))
+            print("-" * 20)
 
 if __name__ == "__main__":
-    print("🚀 Starting LLM Processor Tests...")
-    print("This will make actual API calls to test the functions.")
-    print("Make sure your GOOGLE_API_KEY is set in the .env file.")
-    print()
-
-    try:
-        asyncio.run(_test_llm_processor())
-    except KeyboardInterrupt:
-        print("\n❌ Tests interrupted by user.")
-    except Exception as e:
-        print(f"\n❌ Test runner failed: {e}")
-        traceback.print_exc()
-
-    print("\n✅ Test runner finished.")
+    asyncio.run(_test_llm_processor())

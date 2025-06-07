@@ -106,8 +106,8 @@ if __name__ == '__main__':
 
     # Busy slots from your example response (ensure they are for the query day)
     test_busy_slots = [
-        {"start": "2025-06-02T09:00:00+05:30", "end": "2025-06-02T10:30:00+05:30"}, # Study ConSys + Deep Dive
-        {"start": "2025-06-02T13:00:00+05:30", "end": "2025-06-02T15:45:00+05:30"}  # Lunch + Study MuE
+        {"start": "2025-06-02T09:00:00+05:30", "end": "2025-06-02T10:30:00+05:30"},
+        {"start": "2025-06-02T13:00:00+05:30", "end": "2025-06-02T15:45:00+05:30"}
     ]
     # More busy slots for testing
     # test_busy_slots.append({"start": "2025-06-02T16:00:00+05:30", "end": "2025-06-02T17:00:00+05:30"})
