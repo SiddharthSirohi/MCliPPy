@@ -1,6 +1,6 @@
 # MCliPPy 🤖✉️🗓️
 
-**MCliPPy (MCP + CLI + Python + Clippy homage)** is a proactive, terminal-based personal assistant designed to streamline your daily workflow by intelligently managing your Gmail and Google Calendar. Powered by Google's Gemini models and leveraging the Model Context Protocol (MCP) via Composio.dev for secure access to your services, MCliPPy keeps you ahead of your schedule and communications.
+**MCliPPy (MCP + CLI + Python + Clippy homage)** is a proactive, terminal-based personal assistant designed to streamline your daily workflow by intelligently managing your Gmail and Google Calendar, and executing sequences of actions to achieve a task in response to natural language instructions. Powered by Google's Gemini models and leveraging the Model Context Protocol (MCP) via Composio.dev for secure access to your services, MCliPPy keeps you ahead of your schedule and communications. 
 
 
 ## ✨ Features
@@ -23,6 +23,12 @@
         *   **Delete Events:** Quickly cancel or remove events from your calendar.
         *   **Create Follow-up/Related Events:** Schedule new events based on existing ones.
         *   **Find Free Slots:** Check availability around existing events or for new ones.
+*   <b>Natural Language Commands (Experimental 🧪):</b>
+    *   **Chat with MCliPPy:** Tell MCliPPy what you want to do in plain English (e.g., "Draft an email to Jane about the Project Phoenix update," or "Schedule a 30-min meeting with Alex for tomorrow afternoon and invite sarah@example.com").
+    *   **Autonomous Multi-Step Actions:** MCliPPy (via Gemini) can plan and execute a sequence of tool calls to achieve more complex tasks.
+    *   **Current Status:**
+        *   **Gmail:** Functionality is present but may be unstable (e.g., potential MCP server connection timeout issues during complex interactions).
+        *   **Google Calendar:** Natural language actions for calendar events are **currently not working reliably** and are under active development/debugging.
 *   **macOS System Notifications:**
     *   Get native macOS notifications for new important emails or actionable calendar events.
     *   Click "Open Assistant" on the notification to launch an interactive terminal session pre-loaded with the relevant items.
@@ -104,6 +110,36 @@ These instructions are for macOS.
             }'
             ```
         5.  From the response, note the **server UUID** for Google Calendar.
+    *   **Integrated Gmail + Google Calendar MCP Server: (Optional, Required for Experimental Natural Language Chat Actions)** 
+      
+         A single MCP server instance that has access to *both* Gmail and Google Calendar toolkits.
+      1.  Create the Integrated Server: 
+           ```bash
+           curl -X POST https://backend.composio.dev/api/v3/mcp/servers/custom \
+           -H "x-api-key: YOUR_COMPOSIO_API_KEY" \
+           -H "Content-Type: application/json" \
+           -d '{
+             "name": "MCliPPy_IntegratedServer",
+             "toolkits": [
+               "gmail",
+               "googlecalendar"
+             ]
+           }'
+           ```
+           Note the **`id` (this is your `INTEGRATED_MCP_SERVER_UUID`)** and the `mcp_url` from the response.
+       2.  Enable All Actions for the Integrated Server:
+           Replace `<INTEGRATED_MCP_SERVER_UUID>` and `YOUR_COMPOSIO_API_KEY` below.
+           ```bash
+           curl -X PATCH https://backend.composio.dev/api/v3/mcp/<INTEGRATED_MCP_SERVER_UUID> \
+           -H "x-api-key: YOUR_COMPOSIO_API_KEY" \
+           -H "Content-Type: application/json" \
+           -d '{
+             "name": "MCliPPy_IntegratedServer", 
+             "apps": ["gmail","googlecalendar"],
+             "actions": ["GOOGLECALENDAR_CREATE_EVENT", "GOOGLECALENDAR_DELETE_EVENT", "GOOGLECALENDAR_FIND_EVENT", "GOOGLECALENDAR_FIND_FREE_SLOTS", "GOOGLECALENDAR_GET_CURRENT_DATE_TIME", "GOOGLECALENDAR_PATCH_CALENDAR", "GOOGLECALENDAR_UPDATE_EVENT", "GMAIL_ADD_LABEL_TO_EMAIL", "GMAIL_CREATE_EMAIL_DRAFT", "GMAIL_DELETE_DRAFT", "GMAIL_DELETE_MESSAGE", "GMAIL_FETCH_EMAILS", "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", "GMAIL_FETCH_MESSAGE_BY_THREAD_ID", "GMAIL_GET_ATTACHMENT", "GMAIL_GET_CONTACTS", "GMAIL_GET_PEOPLE", "GMAIL_GET_PROFILE", "GMAIL_LIST_DRAFTS", "GMAIL_LIST_LABELS", "GMAIL_LIST_THREADS", "GMAIL_MODIFY_THREAD_LABELS", "GMAIL_MOVE_TO_TRASH", "GMAIL_REPLY_TO_THREAD", "GMAIL_SEARCH_PEOPLE", "GMAIL_SEND_EMAIL"]
+           }'
+           ```
+
 
 ### Installation & Setup
 
@@ -131,6 +167,8 @@ These instructions are for macOS.
         GOOGLE_API_KEY=your_google_gemini_api_key_here
         GMAIL_MCP_SERVER_UUID=your_composio_gmail_server_uuid_here
         CALENDAR_MCP_SERVER_UUID=your_composio_gcal_server_uuid_here
+        # For Experimental Natural Language Chat:
+        # INTEGRATED_MCP_SERVER_UUID=your_composio_integrated_server_uuid_here
         ```
 5.  **First Run & Signup:**
     *   Run the assistant manually for the first time to go through the setup:
@@ -168,6 +206,10 @@ These instructions are for macOS.
         python assistant.py
         ```
         This will perform a fresh check and then enter the interactive action loop.
+*   **Natural Language Instruction Mode:**
+    *   **Within a Run:** After the actionables are displayed and the menu options are available, input 'c' or 'chat' to enter natural language instruction mode.
+    *   **Only NLI Mode:** Run `chat.py` in your terminal in the project directory.
+
 
 ## 🛠️ Code Structure
 
@@ -175,6 +217,7 @@ These instructions are for macOS.
 *   **`config_manager.py`**: Manages loading and saving of `.env` (developer secrets) and `user_config.json` (user-specific runtime settings, persona, preferences, temporary actionable data).
 *   **`mcp_handler.py`**: Contains the `McpSessionManager` class for all interactions with Composio MCP servers (Gmail, Google Calendar). Handles connections, authentication flows via Composio helper tools, and specific tool calls (e.g., fetching emails, updating events).
 *   **`llm_processor.py`**: Houses all logic for interacting with the Gemini LLM. Includes functions for summarizing emails/events, suggesting actions, drafting email replies, and parsing structured data from natural language for event creation/updates.
+*   **`chat.py`**: Houses the agent chat processes and execution of instructions in natural language instructions. Modular and can be executed independently if only natural languge mode is required.
 *   **`user_interface.py`**: Manages all terminal input and output. Provides styled prompts, displays formatted information, and handles interactive menus for user actions. Uses `colorama`.
 *   **`notifier.py`**: Responsible for sending macOS system notifications using the `terminal-notifier` CLI tool. Constructs AppleScript commands to make notification buttons interactive.
 *   **`calendar_utils.py`**: Contains utility functions for calendar-related logic, notably `calculate_free_slots` which processes busy times from Google Calendar to find available meeting slots.
@@ -190,6 +233,7 @@ These instructions are for macOS.
     *   Suggest contextually relevant quick actions.
     *   Draft email replies (incorporating found free slots if requested).
     *   Parse details from user suggestions for creating new calendar events.
+    *   **For Natural Language Commands:** Interprets user intent, selects appropriate MCP tools from a wide range of available Gmail & Calendar actions, formulates parameters, and can plan multi-step operations. *(User confirmation for execution of LLM-decided actions is a planned future enhancement for safety.)*
 *   **Interactive Quick Actions:** Users can select LLM-suggested actions or interact through menus to manage emails (reply) and calendar events (create, update, delete, find free slots).
 *   **Timeout-Resilient Actions:** MCP sessions for executing user-chosen actions are established just-in-time to prevent connection timeouts during user input delays.
 *   **`launchd` Scheduling:** Enables true background operation on macOS, with generated `.plist` files for user-configured schedules.
@@ -197,7 +241,10 @@ These instructions are for macOS.
 
 ## 🔮 Future Enhancements (Roadmap Ideas)
 
-*   **Natural Language Command Input:** Allow users to type free-form commands like "Reschedule my 3pm meeting to 4pm" or "Draft an email to Jane about Project X."
+*   **Stabilize Natural Language Actions:**
+    *   Reliably fix any MCP server connection/timeout issues during NLI chat.
+    *   Fully debug and enable robust natural language commands for Google Calendar actions.
+*   **User Confirmation for LLM-Decided Actions:** Implement a mandatory user confirmation step before MCliPPy executes any tool call decided by the LLM during natural language interaction.
 *   **Additional Service Integrations:** Expand to Slack, Notion, To-Do lists, etc., via more Composio MCP servers or custom-built ones.
 *   **Create Generalised MCP Handlers:** Allow users to expose more tools through Composio MCP servers for use with Gemini without manual code changes.
 *   **Configuration Update UI:** Allow users to change preferences (schedule, persona) after initial setup without manually editing JSON.
